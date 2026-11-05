@@ -93,14 +93,21 @@ Consultas -	1 registro de pessoas e 1 de produtos por vez
 Sobre uso da IA no trabalho:
 
 Foi usado o Claude como ferramenta para gerar código, foi utilizado um prompt geral para criação de menus e funções, conforme testes fui solicitando para alterar funções, mudar funcionalidades para se adaptar com nosso conteudo.
+
 Foi solicitado para ter a importação de arquivo para facilitar o uso do algoritmo, o programa transforma o CSV em arquivo binario par usar na consulta.
+
 A maneira que o índice funciona, criando níveis conforme a quantidade de entradas, foi ideia minha, solicitei que o índice deveria ser a quantidade de linhas dividido pelo valor K (atualmente é 100), esse seria o nível 1, depois se esse valor continuasse maior que K, ele cria o nível 2, que repete o processo, a cada K entradas do nível 1, cria uma entrada no nível 2, se o nível 2 tiver mais de K entradas, é criado o nível 3 e assim por diante.
+
 As funcionalidades no menu foram escolhidas uma por uma, conforme necessidade e para atender os requisitos indicados no AVA, foi solicitado para IA gerar o código para manipular o arquivo de dados e arquivo de índice para gerar a saída desejada.
+
 Pedido para dividir o código entre consultas, modelos, main, e tabela, esses mesmos arquivos foram detalhados mais acima a funcionalidade.
 O código ia sendo gerado pelo Claude IA e manualmente ia encaixando no programa.
+
 Solicitado para as pesquisas feitas com índice carregassem um nível por vez na memória para não sobrecarregar e após achar o bloco de tamanho K, pesquisar apenas dentro desse bloco.
+
 Para adição de registros foi pedido para que fosse criado uma área de extensão dentro do próprio arquivo de dados, após a pesquisa dentro dos blocos, era pesquisado dentro da área de extensão, para essa área funcionar, foi criado um campo ELO ainda antes de importar as tabelas, para colocar o valor da próxima posição de memória que deve ser acessado antes de continuar a sequencia. 
 Foi também adicionado a coluna EXCLUIDO, caso o registro fosse excluído era adicionado uma marcação nessa coluna, ao ler o registro com esse campo marcado, esse registro era ignorado.
+
 Solicitado a criação de uma função que reescreve a tabela, excluí fisicamente os itens excluídos e reorganiza a ordem dos registros baseado no campo ELO.
 
 Em resumo, a IA gerou grande parte do código, meu trabalho foi entender o que a IA gerou e ir encaixando os códigos para gerar o programa, solicitar para a IA o que preciso e a maneira que tem que ser feito e testar a funcionalidade, não só se está saindo o resultado esperado, mas se o método solicitado está realmente sendo utilizado.
