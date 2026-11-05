@@ -92,7 +92,7 @@ Consultas -	1 registro de pessoas e 1 de produtos por vez
 
 Sobre uso da IA no trabalho:
 
-Foi usado o Claude como ferramenta para gerar código, foi utilizado um prompt geral para criação de menus e funções, conforme testes fui solicitando para alterar funções, mudar funcionalidades para se adaptar com nosso conteudo.
+Foi usado o Claude Sonnet 5.5 médio como ferramenta para gerar código, foi utilizado um prompt geral para criação de menus e funções, conforme testes fui solicitando para alterar funções, mudar funcionalidades para se adaptar com nosso conteudo.
 
 Foi solicitado para ter a importação de arquivo para facilitar o uso do algoritmo, o programa transforma o CSV em arquivo binario par usar na consulta.
 
