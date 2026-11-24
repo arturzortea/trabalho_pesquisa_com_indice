@@ -20,7 +20,7 @@ Tabela produtos = {
     .nome       = "Produtos",
     .arq_dados  = "produtos.dat",
     .arq_indice = "produtos.idx",
-    .csv_padrao = "dados-produto2.csv",
+    .csv_padrao = "dados-produto.csv",
     .campos     = {
         { "product_id",  12, T_NUM },
         { "brand",       20, T_TXT },
@@ -30,6 +30,8 @@ Tabela produtos = {
     .n_campos   = 4,
     .idx_chave  = P_PRODUCT_ID,
     .k          = K_INDICE,
+    .usa_arvore = 1,            /* menor arquivo: também ganha índice árvore B+ em memória */
+    .ordem_arvore = 2,          /* ordem inicial da árvore B+ (1, 2 ou 3); muda na opção 13 */
 };
 
 /*
@@ -47,7 +49,7 @@ Tabela pessoas = {
     .nome       = "Pessoas (eventos)",
     .arq_dados  = "pessoas.dat",
     .arq_indice = "pessoas.idx",
-    .csv_padrao = "dados-pessoa2.csv",
+    .csv_padrao = "dados-pessoa.csv",
     .campos     = {
         { "id_consulta", 10, T_NUM },
         { "user_id",    10, T_NUM },
@@ -58,4 +60,6 @@ Tabela pessoas = {
     .n_campos   = 5,
     .idx_chave  = E_ID_CONSULTA,
     .k          = K_INDICE,
+    .usa_hash   = 1,            /* índice hash em memória sobre product_id (não é a chave) */
+    .campo_hash = E_PRODUCT_ID,
 };

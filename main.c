@@ -1,11 +1,13 @@
 /*
  * Trabalho 1 - Algoritmos e Estruturas de Dados II
  * Arquivos de dados binários com índice parcial (sequencial-indexado)
- * Menu interativo no terminal.
  */
+
 #include "tabela.h"
 #include "modelos.h"
 #include "consultas.h"
+#include "arvoreb.h"
+#include "hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,11 +15,25 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
+#define mudar_pasta _chdir
+#else
+#include <unistd.h>
+#define mudar_pasta chdir
 #endif
 
-/* ------------------------------------------------------------------ */
-/* Entrada / saída                                                     */
-/* ------------------------------------------------------------------ */
+/*
+ * Compilação em um arquivo só: o botão "play" do VS Code (e o Code Runner) compila
+ * apenas o arquivo aberto. Incluindo os outros módulos aqui, basta compilar main.c:
+ *     gcc main.c -o trabalho1
+ * (NÃO passe tabela.c, modelos.c, consultas.c ou arvoreb.c junto, senão as funções
+ *  ficam definidas duas vezes.)
+ */
+#include "tabela.c"
+#include "modelos.c"
+#include "consultas.c"
+#include "arvoreb.c"
+#include "hash.c"
 
 static void encerrar(int cod)
 {
@@ -65,9 +81,7 @@ static void aguardar_enter(void)
     ler_linha("\nPressione Enter para voltar ao menu...", b, sizeof b);
 }
 
-/* ------------------------------------------------------------------ */
-/* Ações do menu de tabela                                             */
-/* ------------------------------------------------------------------ */
+/* Ações do menu de tabela */
 
 static void acao_importar(Tabela *t)
 {
@@ -177,15 +191,38 @@ static void mostrar_loc(const Loc *L, int por_indice)
         printf("Acessos ao disco no arquivo de dados: %ld\n", L->cmp_dados + L->cmp_ext);
 }
 
-static void acao_busca(Tabela *t, int por_indice)
+enum { BUSCA_BINARIA = 0, BUSCA_INDICE = 1, BUSCA_ARVORE = 2 };
+
+static void acao_busca(Tabela *t, int metodo)
 {
     unsigned long long chave;
     char prompt[96];
     Loc L;
     char *buf;
+    int por_indice = metodo == BUSCA_INDICE;
 
     snprintf(prompt, sizeof prompt, "Valor de %s: ", t->campos[t->idx_chave].nome);
     if (!ler_u64(prompt, 0, 0, &chave)) return;
+
+    if (metodo == BUSCA_ARVORE) {
+        if (!t->arvore) { printf("Árvore B+ indisponível.\n"); return; }
+        tabela_busca_arvore(t, chave, &L);
+        printf("\nMétodo: árvore B+ em memória (raiz até a folha) + 1 seek no arquivo de dados\n");
+        printf("Nós visitados na memória: %ld (altura da árvore)\n", L.cmp_idx);
+        if (!L.achou) { printf("Chave %llu não encontrada (nenhum acesso ao disco).\n", chave); return; }
+        printf("Endereço na folha: registro %lld (byte %lld do arquivo)\n",
+               (long long)L.pos, (long long)(L.pos + 1) * t->tam_reg);
+        buf = tabela_novo_buf(t);
+        if (!buf) return;
+        if (tabela_ler_reg(t, L.pos, buf) == 0) {
+            tabela_imprimir_cab(t);
+            tabela_imprimir_reg(t, buf, L.pos);
+            if (tabela_removido(t, buf)) printf("(este registro está marcado como removido)\n");
+        }
+        printf("Acessos ao disco: 1 (só a leitura do registro)\n");
+        free(buf);
+        return;
+    }
 
     if (por_indice) {
         if (!t->idx_ok) { printf("Índice indisponível.\n"); return; }
@@ -281,8 +318,155 @@ static void acao_info(Tabela *t)
     tabela_indice_listar(t, 20);
 }
 
+/* Ações da árvore B+ */
+
+static void arvore_info(Tabela *t)
+{
+    ArvoreBP *a = t->arvore;
+    BPStats s;
+    double ocup_f, ocup_i = 0;
+    long nos_int = 0, ch_int = 0;
+
+    bp_estatisticas(a, &s);
+    for (int i = 0; i < s.niveis - 1; i++) { nos_int += s.nos[i]; ch_int += s.chaves[i]; }
+    ocup_f = s.nos[s.niveis - 1] ? 100.0 * s.chaves[s.niveis - 1] / ((double)s.nos[s.niveis - 1] * a->max_chaves) : 0;
+    if (nos_int) ocup_i = 100.0 * ch_int / ((double)nos_int * a->max_chaves);
+
+    printf("\n--- Árvore B+ em memória sobre %s (%s) ---\n", t->campos[t->idx_chave].nome, t->arq_dados);
+    printf("Ordem ...................... %d  => até %d registros por nó (mínimo %d, exceto na raiz)\n",
+           a->ordem, a->max_chaves, a->min_chaves);
+    printf("Nó interno ................. até %d chaves separadoras e %d filhos\n", a->max_chaves, a->max_chaves + 1);
+    printf("Folha ...................... até %d elementos (chave, endereço do registro)\n", a->max_chaves);
+    printf("Chaves indexadas ........... %ld (registros do arquivo, inclusive extensão e removidos)\n", a->n_chaves);
+    printf("Altura ..................... %d nível(is)  => %d nó(s) visitado(s) por busca\n", a->altura, a->altura);
+    printf("Nós ........................ %ld (%ld folhas, %ld internos), %lu bytes cada = %lu KiB de memória\n",
+           a->n_nos, a->n_folhas, a->n_nos - a->n_folhas, (unsigned long)a->tam_no,
+           (unsigned long)(a->n_nos * a->tam_no / 1024));
+    printf("Ocupação média ............. folhas %.1f%%, internos %.1f%%\n", ocup_f, ocup_i);
+    printf("Divisões de nós (splits) ... %ld\n", a->divisoes);
+    printf("Estrutura válida ........... %s\n", bp_verificar(a) ? "sim (ordem, limites, ocupação e folhas no mesmo nível)" : "NÃO");
+    for (int i = 0; i < s.niveis; i++)
+        printf("  nível %2d%-9s %7ld nó(s), %8ld chave(s)\n", i,
+               i == 0 ? " (raiz)" : i == s.niveis - 1 ? " (folhas)" : "", s.nos[i], s.chaves[i]);
+}
+
+static void acao_arvore_estrutura(Tabela *t)
+{
+    if (!t->arvore) { printf("Árvore B+ indisponível.\n"); return; }
+    arvore_info(t);
+    printf("\nConteúdo por nível (primeiros nós de cada nível):\n");
+    bp_imprimir(t->arvore, 4, 2 * BP_ORDEM_MAX);
+    aguardar_enter();
+}
+
+static void acao_arvore_ordem(Tabela *t)
+{
+    unsigned long long ordem;
+    char prompt[128];
+    snprintf(prompt, sizeof prompt, "Ordem da árvore (1 = 2 por nó, 2 = 4 por nó, 3 = 6 por nó) [atual %d]: ",
+             t->ordem_arvore);
+    if (!ler_u64(prompt, (unsigned long long)t->ordem_arvore, 1, &ordem)) return;
+    if (ordem < BP_ORDEM_MIN || ordem > BP_ORDEM_MAX) {
+        printf("Ordem inválida: escolha %d, 2 ou %d.\n", BP_ORDEM_MIN, BP_ORDEM_MAX);
+        return;
+    }
+    printf("Montando a árvore de ordem %llu com todos os registros do arquivo...\n", ordem);
+    if (tabela_arvore_construir(t, (int)ordem) != 0) { printf("Erro: %s\n", t->erro); return; }
+    arvore_info(t);
+}
+
+/* Ações da tabela hash */
+
+static void imprimir_balde(const TabelaHash *h, size_t b, uint64_t destaque)
+{
+    int i = 0;
+    printf("Balde %lu:", (unsigned long)b);
+    if (!h->baldes[b]) printf(" (vazio)");
+    for (const NoHash *no = h->baldes[b]; no; no = no->prox) {
+        if (i++ >= 8) { printf(" -> ..."); break; }
+        printf("%s[%llu: %d reg.]%s", i > 1 ? " -> " : " ", (unsigned long long)no->chave, no->n,
+               no->chave == destaque ? "*" : "");
+    }
+    printf("\n");
+}
+
+static void acao_hash_busca(Tabela *t)
+{
+    TabelaHash *h = t->hash;
+    const NoHash *no;
+    unsigned long long valor, lim;
+    char prompt[96], *buf;
+    int comp;
+    long mostrados = 0, removidos = 0;
+    const char *col = t->campos[t->campo_hash].nome;
+
+    if (!h) { printf("Tabela hash indisponível.\n"); return; }
+    snprintf(prompt, sizeof prompt, "Valor de %s: ", col);
+    if (!ler_u64(prompt, 0, 0, &valor)) return;
+
+    no = th_buscar(h, valor, &comp);
+    printf("\nMétodo: tabela hash em memória sobre %s (encadeamento separado)\n", col);
+    printf("h(%llu) = %llu mod %lu = balde %lu\n", valor, valor, (unsigned long)h->m,
+           (unsigned long)th_funcao(h, valor));
+    imprimir_balde(h, th_funcao(h, valor), valor);
+    printf("Comparações na cadeia do balde: %d\n", comp);
+    if (!no) { printf("Nenhum registro com %s = %llu (nenhum acesso ao disco).\n", col, valor); return; }
+
+    printf("%d registro(s) com %s = %llu.\n", no->n, col, valor);
+    if (!ler_u64("Quantos mostrar [20]: ", 20, 1, &lim)) return;
+    buf = tabela_novo_buf(t);
+    if (!buf) return;
+    tabela_imprimir_cab(t);
+    for (int i = 0; i < no->n && mostrados < (long)lim; i++) {
+        if (tabela_ler_reg(t, no->end[i], buf) != 0) continue;
+        tabela_imprimir_reg(t, buf, no->end[i]);
+        if (tabela_removido(t, buf)) removidos++;
+        mostrados++;
+    }
+    if (no->n > mostrados) printf("... (mais %ld registro(s) não mostrados)\n", (long)no->n - mostrados);
+    printf("Acessos ao disco: %ld (1 por registro mostrado; o endereço vem da lista do nó)\n", mostrados);
+    if (removidos) printf("%ld dos registros mostrados estão marcados como removidos.\n", removidos);
+    free(buf);
+    aguardar_enter();
+}
+
+static void acao_hash_info(Tabela *t)
+{
+    TabelaHash *h = t->hash;
+    THStats s;
+    long mostrados = 0;
+
+    if (!h) { printf("Tabela hash indisponível.\n"); return; }
+    th_estatisticas(h, &s);
+    printf("\n--- Tabela hash em memória sobre %s (%s) ---\n", t->campos[t->campo_hash].nome, t->arq_dados);
+    printf("Função hash ................ h(k) = k mod M (método da divisão, M primo)\n");
+    printf("Colisões ................... encadeamento separado: cada balde é uma lista ligada de nós\n");
+    printf("Valores repetidos .......... cada nó guarda a lista de endereços dos registros com aquele valor\n");
+    printf("Baldes (M) ................. %lu\n", (unsigned long)s.m);
+    printf("Valores distintos .......... %ld\n", h->n_chaves);
+    printf("Registros indexados ........ %ld\n", h->n_enderecos);
+    printf("Fator de carga ............. %.3f (valores distintos / M; rehash acima de %.1f)\n", s.carga, TH_CARGA_MAX);
+    printf("Redimensionamentos ......... %ld\n", h->rehashes);
+    printf("Colisões na inserção ....... %ld (valor novo caiu em balde já ocupado)\n", h->colisoes);
+    printf("Baldes vazios .............. %ld (%.1f%%)\n", s.vazios, 100.0 * s.vazios / (double)s.m);
+    printf("Baldes com 1 valor ......... %ld\n", s.com_um);
+    printf("Baldes com colisão (2+) .... %ld\n", s.com_colisao);
+    printf("Maior cadeia ............... %d nó(s)\n", s.maior_cadeia);
+    printf("Comparações médias ......... %.2f por busca bem-sucedida\n", s.media_comp);
+    printf("Valor mais repetido ........ %llu (%ld registros)\n", (unsigned long long)s.chave_maior_lista, s.maior_lista);
+    printf("Distribuição: 0 nós: %ld | 1: %ld | 2: %ld | 3: %ld | 4: %ld | 5+: %ld baldes\n",
+           s.dist[0], s.dist[1], s.dist[2], s.dist[3], s.dist[4], s.dist[5]);
+
+    printf("\nExemplos de baldes com colisão:\n");
+    for (size_t b = 0; b < h->m && mostrados < 5; b++)
+        if (h->baldes[b] && h->baldes[b]->prox) { imprimir_balde(h, b, 0); mostrados++; }
+    if (mostrados == 0) printf("(nenhum)\n");
+    aguardar_enter();
+}
+
 static void menu_tabela(Tabela *t)
 {
+    int op;
     for (;;) {
         printf("\n=========== %s  [%s] ===========\n", t->nome, t->arq_dados);
         printf("Área principal: %lld registros | Extensão: %lld registros | Índice: %llu nível(is), 1 entrada a cada %llu\n",
@@ -297,14 +481,30 @@ static void menu_tabela(Tabela *t)
         puts(" 8 - Remover registro (marca o campo delete)");
         puts(" 9 - Reorganizar arquivo (aplica extensão, descarta removidos, refaz índice)");
         puts("10 - Informações do arquivo e como o índice foi construído");
+        if (t->usa_arvore) {
+            puts("11 - Consulta pela árvore B+ (índice em memória)");
+            puts("12 - Árvore B+: ordem, níveis e conteúdo dos nós");
+            puts("13 - Árvore B+: trocar a ordem (1, 2 ou 3)");
+        } else if (t->usa_hash) {
+            printf("11 - Consulta por %s pela tabela hash (índice em memória)\n", t->campos[t->campo_hash].nome);
+            puts("12 - Tabela hash: função, colisões e distribuição dos baldes");
+        }
         puts(" 0 - Voltar");
-        switch (ler_opcao()) {
+        op = ler_opcao();
+        if (op >= 11 && op <= 13 && !t->usa_arvore)                 /* opções do hash: 111 e 112 */
+            op = (t->usa_hash && op <= 12) ? 100 + op : -1;
+        switch (op) {
+            case 111: acao_hash_busca(t); break;
+            case 112: acao_hash_info(t); break;
             case 1:  acao_importar(t); break;
             case 2:  acao_primeiros(t); break;
             case 3:  acao_intervalo(t); break;
             case 4:  acao_intervalo_logico(t); break;
-            case 5:  acao_busca(t, 0); break;
-            case 6:  acao_busca(t, 1); break;
+            case 5:  acao_busca(t, BUSCA_BINARIA); break;
+            case 6:  acao_busca(t, BUSCA_INDICE); break;
+            case 11: acao_busca(t, BUSCA_ARVORE); break;
+            case 12: acao_arvore_estrutura(t); break;
+            case 13: acao_arvore_ordem(t); break;
             case 7:  acao_inserir(t); break;
             case 8:  acao_remover(t); break;
             case 9:  acao_reorganizar(t); break;
@@ -345,11 +545,40 @@ static void menu_consultas(void)
     }
 }
 
+static int existe(const char *nome)
+{
+    FILE *f = fopen(nome, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* O botão "play" do VS Code (extensão C/C++ Compile Run) gera o executável na subpasta
+ * output/ e o roda de lá. Nesse caso os arquivos .dat e .csv não estão na pasta atual:
+ * o programa volta para a pasta do projeto (onde está o main.c) antes de abrir os dados. */
+static void ir_para_pasta_do_projeto(void)
+{
+    char pasta[1024], *barra;
+    if (existe("main.c")) return;                                  /* já está na pasta do projeto */
+    if (existe("../main.c")) { mudar_pasta(".."); return; }       /* rodando de output/ (mesmo que
+                                                                      ali tenha sobrado um .dat vazio) */
+    if (existe(produtos.arq_dados)) return;                       /* executável copiado junto dos dados */
+
+    /* __FILE__ tem o caminho do main.c usado na compilação */
+    snprintf(pasta, sizeof pasta, "%s", __FILE__);
+    barra = strrchr(pasta, '/');
+    if (!barra || (strrchr(pasta, '\\') && strrchr(pasta, '\\') > barra)) barra = strrchr(pasta, '\\');
+    if (barra) {
+        *barra = '\0';
+        mudar_pasta(pasta);
+    }
+}
+
 int main(void)
 {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);        /* acentos corretos no cmd/terminal do VS Code */
 #endif
+    ir_para_pasta_do_projeto();
     printf("Trabalho 1 - Arquivos binários com índice parcial\n");
     if (tabela_abrir(&produtos) != 0) { printf("Erro ao abrir produtos: %s\n", produtos.erro); return 1; }
     if (tabela_abrir(&pessoas)  != 0) { printf("Erro ao abrir pessoas: %s\n",  pessoas.erro);  return 1; }

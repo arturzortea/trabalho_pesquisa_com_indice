@@ -1,4 +1,6 @@
 #include "tabela.h"
+#include "arvoreb.h"
+#include "hash.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -432,11 +434,17 @@ int tabela_abrir(Tabela *t)
         printf("  [%s] índice ausente ou desatualizado: reconstruindo '%s'...\n", t->nome, t->arq_indice);
         if (tabela_indice_construir(t) != 0) return -1;
     }
+    if (t->usa_hash && tabela_hash_construir(t) != 0)
+        printf("  [%s] aviso: não foi possível montar a tabela hash (%s)\n", t->nome, t->erro);
+    if (t->usa_arvore && tabela_arvore_construir(t, t->ordem_arvore) != 0)
+        printf("  [%s] aviso: não foi possível montar a árvore B+ (%s)\n", t->nome, t->erro);
     return 0;
 }
 
 void tabela_fechar(Tabela *t)
 {
+    if (t->arvore) { bp_destruir(t->arvore); t->arvore = NULL; }
+    if (t->hash)   { th_destruir(t->hash);   t->hash = NULL; }
     /* o índice é gravado sempre que muda; aqui só garantimos que existe e está coerente */
     if (t->f && !t->idx_ok) tabela_indice_construir(t);
     if (t->fi) { fclose(t->fi); t->fi = NULL; }
@@ -598,6 +606,12 @@ int tabela_inserir(Tabela *t, const char *const vals[])
         /* chave existia mas estava removida: reativa no mesmo lugar, preservando o elo */
         montar_registro(t, vals, 0, tabela_elo(t, old), buf);
         if (escrever_reg(t, L.pos, buf) != 0) goto fim;
+        if (t->hash) {                                    /* o valor da coluna pode ter mudado */
+            th_remover(t->hash, tabela_campo_u64(t, old, t->campo_hash), L.pos);
+            if (th_inserir(t->hash, tabela_campo_u64(t, buf, t->campo_hash), L.pos) < 0) {
+                th_destruir(t->hash); t->hash = NULL;
+            }
+        }
         snprintf(t->erro, sizeof t->erro, "esse registro já existia como removido e foi reativado");
         r = 1;
         goto fim;
@@ -614,8 +628,17 @@ int tabela_inserir(Tabela *t, const char *const vals[])
 
     t->n_ext++;
     r = cab_escrever(t);
+    if (r == 0 && t->hash && th_inserir(t->hash, tabela_campo_u64(t, buf, t->campo_hash), novo) < 0) {
+        th_destruir(t->hash);                            /* sem memória: hash deixa de valer */
+        t->hash = NULL;
+    }
+    if (r == 0 && t->arvore && bp_inserir(t->arvore, chave, novo) < 0) {
+        bp_destruir(t->arvore);                          /* sem memória: árvore deixa de valer */
+        t->arvore = NULL;
+    }
     if (r == 0)
-        snprintf(t->erro, sizeof t->erro, "registro inserido na área de extensão e ligado pelo campo elo");
+        snprintf(t->erro, sizeof t->erro, "registro inserido na área de extensão e ligado pelo campo elo%s",
+                 t->arvore ? " (e incluído na árvore B+)" : "");
 fim:
     free(buf);
     free(old);
@@ -756,7 +779,104 @@ int tabela_reorganizar(Tabela *t, long *incorporados, long *descartados)
 
     if (incorporados) *incorporados = c.da_extensao;
     if (descartados)  *descartados = c.descartados;
-    return tabela_indice_construir(t);
+    if (tabela_indice_construir(t) != 0) return -1;
+    if (t->usa_arvore) tabela_arvore_construir(t, t->ordem_arvore);
+    if (t->usa_hash) tabela_hash_construir(t);
+    return 0;
+}
+
+/* ======================================================================
+ *  Índice árvore B+ em memória
+ * ====================================================================== */
+
+static int cb_arvore(Tabela *t, const char *reg, int64_t pos, void *vctx)
+{
+    ArvoreBP *a = (ArvoreBP *)vctx;
+    return bp_inserir(a, tabela_chave(t, reg), pos) < 0;      /* para se faltar memória */
+}
+
+int tabela_arvore_construir(Tabela *t, int ordem)
+{
+    ArvoreBP *a = bp_criar(ordem);
+    if (!a) { snprintf(t->erro, sizeof t->erro, "memória insuficiente para a árvore B+"); return -1; }
+
+    /* percorre o arquivo inteiro (área principal + extensão pelos elos) e insere (chave, endereço) */
+    if (tabela_percorrer(t, cb_arvore, a) != 0) {
+        bp_destruir(a);
+        snprintf(t->erro, sizeof t->erro, "falha ao montar a árvore B+");
+        return -1;
+    }
+    if (t->arvore) bp_destruir(t->arvore);
+    t->arvore = a;
+    t->ordem_arvore = ordem;            /* importação/reorganização refazem com a ordem escolhida */
+    return 0;
+}
+
+int tabela_busca_arvore(Tabela *t, uint64_t chave, Loc *L)
+{
+    int nos = 0;
+    loc_init(L);
+    if (!t->arvore) return -1;
+    L->achou = bp_buscar(t->arvore, chave, &L->pos, &nos);
+    if (!L->achou) L->pos = -1;
+    L->cmp_idx = nos;                   /* nós visitados na memória: nenhum acesso ao disco */
+    return 0;
+}
+
+int tabela_localizar_rapido(Tabela *t, uint64_t chave, Loc *L)
+{
+    return t->arvore ? tabela_busca_arvore(t, chave, L) : tabela_localizar(t, chave, L);
+}
+
+/* ======================================================================
+ *  Índice hash em memória (coluna que não é a chave)
+ * ====================================================================== */
+
+uint64_t tabela_campo_u64(const Tabela *t, const char *reg, int i)
+{
+    uint64_t v;
+    memcpy(&v, reg + t->off[i], TAM_NUM);
+    return v;
+}
+
+#define HASH_LOTE 4096      /* registros lidos por fread na construção */
+
+int tabela_hash_construir(Tabela *t)
+{
+    int64_t total = t->n_princ + t->n_ext;
+    TabelaHash *h;
+    char *lote;
+
+    if (t->campos[t->campo_hash].tipo != T_NUM) {
+        snprintf(t->erro, sizeof t->erro, "a coluna do hash precisa ser numérica");
+        return -1;
+    }
+    /* começa já com ~1/8 do nº de registros de baldes; o rehash ajusta conforme os valores distintos */
+    h = th_criar(total / 8 > TH_M_INICIAL ? (size_t)(total / 8) : TH_M_INICIAL);
+    lote = (char *)malloc((size_t)HASH_LOTE * (size_t)t->tam_reg);
+    if (!h || !lote) {
+        th_destruir(h); free(lote);
+        snprintf(t->erro, sizeof t->erro, "memória insuficiente para a tabela hash");
+        return -1;
+    }
+
+    /* lê o arquivo em ordem física (principal + extensão), em lotes, e insere (valor, endereço) */
+    if (SEEK64(t->f, (long long)t->tam_reg, SEEK_SET) != 0) goto erro;
+    for (int64_t pos = 0; pos < total; ) {
+        int64_t qtd = total - pos < HASH_LOTE ? total - pos : HASH_LOTE;
+        if (fread(lote, (size_t)t->tam_reg, (size_t)qtd, t->f) != (size_t)qtd) goto erro;
+        for (int64_t i = 0; i < qtd; i++, pos++)
+            if (th_inserir(h, tabela_campo_u64(t, lote + i * t->tam_reg, t->campo_hash), pos) < 0) goto erro;
+    }
+    free(lote);
+    if (t->hash) th_destruir(t->hash);
+    t->hash = h;
+    return 0;
+erro:
+    th_destruir(h);
+    free(lote);
+    snprintf(t->erro, sizeof t->erro, "falha ao montar a tabela hash");
+    return -1;
 }
 
 /* ======================================================================
@@ -857,7 +977,10 @@ rejeita:
 
     t->n_princ = st->gravados;
     if (cab_escrever(t) != 0) return -1;
-    return tabela_indice_construir(t);
+    if (tabela_indice_construir(t) != 0) return -1;
+    if (t->usa_arvore) tabela_arvore_construir(t, t->ordem_arvore);
+    if (t->usa_hash) tabela_hash_construir(t);
+    return 0;
 }
 
 /* ======================================================================

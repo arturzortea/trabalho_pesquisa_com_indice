@@ -7,7 +7,7 @@
             "command": "gcc",
             "args": [
                 "-g", "-Wall", "-Wextra", "-O2",
-                "main.c", "tabela.c", "modelos.c", "consultas.c",
+                "main.c",
                 "-o", "trabalho1"
             ],
             "options": { "cwd": "${workspaceFolder}" },

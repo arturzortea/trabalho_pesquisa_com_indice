@@ -8,7 +8,9 @@ No VS Code, abra a pasta do projeto, compile com Ctrl+Shift+B e execute ./trabal
 
 Pelo terminal:
 
-gcc -Wall -Wextra -O2 main.c tabela.c modelos.c consultas.c -o trabalho1
+gcc -Wall -Wextra -O2 main.c -o trabalho1
+
+O main.c inclui os outros arquivos .c (tabela.c, modelos.c, consultas.c, arvoreb.c), então basta compilar ele. Assim o botão "play" do VS Code funciona com o main.c aberto.
 
 Os CSVs ficam na mesma pasta do executável. No menu, a opção 1 de Produtos e a opção 1 de Pessoas importam o CSV e geram os arquivos .dat e .idx. Para usar os CSVs completos, basta informar o nome do arquivo na importação.
 
@@ -65,6 +67,31 @@ Os níveis são acrescentados até o topo caber em um bloco (K entradas ou menos
 Consulta pelo índice: o programa lê o topo (1 leitura) e desce nível a nível. Em cada nível lê só o bloco de até K entradas apontado pelo nível de cima (1 leitura) e procura nele na memória, com busca binária. O nível 1 aponta para um bloco de até K registros do .dat, que é lido com 1 leitura e pesquisado na memória. Se a chave não está na área principal, o programa segue a cadeia de extensão. O total é um acesso por nível mais um no arquivo de dados. Com 100 mil registros são 3 acessos, contra cerca de 17 da pesquisa binária direto no arquivo.
 
 O .idx é carregado ao abrir o programa. O programa confere o cabeçalho, o tamanho do arquivo e o número de registros, e refaz o índice se ele estiver ausente ou desatualizado. O índice é gravado em disco sempre que é refeito (na importação e na reorganização).
+
+Índice árvore B+ em memória (arquivo de produtos)
+
+O arquivo de produtos (o menor) tem também um índice em memória com árvore B+ sobre a chave de ordenação (product_id), em arvoreb.h e arvoreb.c. Ordem da árvore (definição de Bayer & McCreight): numa árvore de ordem d, cada nó tem no máximo 2d chaves e, exceto a raiz, no mínimo d. Quando um nó fica com 2d+1 chaves, ele é dividido em dois nós com d chaves e uma chave sobe para o pai. Se a raiz divide, a árvore ganha um nível. Ordens disponíveis:
+ordem 1: até 2 registros por nó (com 67 mil produtos, 16 níveis);
+ordem 2: até 4 registros por nó (10 níveis), que é a ordem inicial;
+ordem 3: até 6 registros por nó (8 níveis).
+
+A árvore é montada uma vez, quando o programa abre: percorre o arquivo e insere (product_id, endereço) de cada registro. Depois fica inteira na memória, e cada pesquisa só desce da raiz até a folha. Ela também é refeita na importação, na reorganização e quando a ordem é trocada.
+
+Por ser B+, os nós internos só têm chaves separadoras; os endereços dos registros (número do registro no .dat; byte = (endereço + 1) x tamanho do registro) ficam nas folhas, que são ligadas em lista. A árvore guarda todos os registros do arquivo, inclusive os da extensão e os removidos (eles continuam no mesmo endereço). Uma inserção no menu também insere a chave na árvore.
+
+Menu de produtos: 11 consulta pela árvore (nós visitados na memória + 1 leitura no disco), 12 mostra ordem, níveis, ocupação e o conteúdo dos nós, 13 troca a ordem da árvore (1, 2 ou 3) e a monta de novo. As consultas do menu principal usam a árvore para achar o produto.
+
+Índice hash em memória (arquivo de pessoas, coluna product_id)
+
+O arquivo de pessoas tem um índice em memória com tabela hash sobre product_id, que não é a chave de ordenação (a chave é id_consulta). Fica em hash.h e hash.c. A tabela é montada ao abrir o programa, lendo o pessoas.dat em lotes de 4096 registros, e refeita na importação e na reorganização. Uma inserção no menu também entra no hash.
+
+Função hash: método da divisão, h(k) = k mod M, com M primo. A tabela começa com cerca de 1/8 do número de registros em baldes (131101 para 1.048.577 eventos).
+
+Valores repetidos: o mesmo product_id aparece em muitos eventos (há 67.356 valores distintos; o mais repetido aparece 12.293 vezes). Cada valor distinto é um nó da tabela, e o nó guarda a lista dos endereços de todos os registros com aquele valor.
+
+Resolução de colisões: encadeamento separado. Cada balde é uma lista ligada de nós; quando dois product_id diferentes caem no mesmo balde, o novo nó entra no início da lista. Na busca, o programa calcula h(k) e percorre só a lista daquele balde. Se o fator de carga (valores distintos / M) passar de 1, a tabela cresce para o primeiro primo maior ou igual a 2M e os nós são redistribuídos (rehash). Com os dados atuais: fator de carga 0,51, 11.430 baldes com colisão, maior cadeia com 5 nós e 1,22 comparações em média por busca.
+
+Menu de pessoas: 11 consulta por product_id (mostra o balde, as comparações e os registros; 1 acesso ao disco por registro mostrado), 12 mostra a função, o fator de carga, as colisões e a distribuição dos baldes.
 
 Inserção, remoção e reconstrução do índice:
 Inserção: o registro novo vai para o fim do arquivo (extensão), sem reescrever nada. Ele é ligado pelo campo elo a uma cadeia ordenada por chave, que parte do registro da área principal de maior chave menor que a dele (ou do cab_elo do cabeçalho, se a chave for menor que todas). Assim a busca encontra o registro seguindo os elos. No menu, valor grande demais para o campo ou inválido gera erro e o programa pede o valor de novo. Chave já ativa é recusada. Chave que existia removida é reativada no mesmo lugar.

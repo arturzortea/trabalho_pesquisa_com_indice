@@ -87,6 +87,10 @@ typedef struct Tabela {
     int         n_campos;
     int         idx_chave;      /* índice do campo que é a chave primária     */
     uint64_t    k;              /* espaçamento do índice parcial (>= 2)       */
+    int         usa_arvore;     /* 1 = mantém também um índice árvore B+ em memória */
+    int         ordem_arvore;   /* ordem d da árvore B+ (1, 2 ou 3): até 2d chaves por nó */
+    int         usa_hash;       /* 1 = mantém um índice hash em memória sobre campo_hash */
+    int         campo_hash;     /* coluna (não chave) indexada pela tabela hash          */
 
     /* ---- derivados (tabela_preparar) ---- */
     int         tam_reg;        /* bytes por registro, contando delete, elo e '\n' */
@@ -103,6 +107,8 @@ typedef struct Tabela {
     int64_t     cab_elo;
     CabIdx      idx;
     int         idx_ok;
+    struct ArvoreBP *arvore;    /* índice árvore B+ em memória (NULL se não usa)  */
+    struct TabelaHash *hash;    /* índice hash em memória (NULL se não usa)       */
     char        erro[200];
 } Tabela;
 
@@ -153,6 +159,18 @@ int      tabela_percorrer(Tabela *t, CbReg cb, void *ctx);
 
 /* índice */
 int      tabela_indice_construir(Tabela *t);
+
+/* índice árvore B+ em memória (só para tabelas com usa_arvore = 1).
+ * A árvore guarda (chave, endereço) de TODOS os registros do arquivo, inclusive os da
+ * extensão e os marcados como removidos (que continuam no mesmo endereço). */
+int      tabela_arvore_construir(Tabela *t, int ordem);           /* ordem 1, 2 ou 3 */
+int      tabela_busca_arvore(Tabela *t, uint64_t chave, Loc *L);  /* L->cmp_idx = nós visitados */
+
+/* índice hash em memória sobre a coluna campo_hash (só para tabelas com usa_hash = 1).
+ * Guarda os endereços de TODOS os registros do arquivo (área principal e extensão). */
+int      tabela_hash_construir(Tabela *t);
+uint64_t tabela_campo_u64(const Tabela *t, const char *reg, int i);     /* campo numérico */
+int      tabela_localizar_rapido(Tabela *t, uint64_t chave, Loc *L); /* árvore se houver; senão índice */
 
 /* informações */
 void     tabela_info(Tabela *t);

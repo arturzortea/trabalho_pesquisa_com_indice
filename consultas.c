@@ -10,7 +10,7 @@
 /* 1. Marca -> pessoas que acessaram                                   */
 /*                                                                     */
 /* Percorre o arquivo de pessoas um registro por vez; para cada acesso */
-/* busca o produto pelo índice do arquivo de produtos e confere a      */
+/* busca o produto pela árvore B+ de produtos (em memória) e confere a */
 /* marca. Nada é acumulado na memória: cada acesso encontrado é        */
 /* impresso na hora.                                                   */
 /* ------------------------------------------------------------------ */
@@ -26,7 +26,7 @@ static int igual_sem_caixa(const char *a, const char *b)
 
 typedef struct {
     const char *marca;
-    char       *reg_produto;     /* 1 registro de produto, reaproveitado a cada busca */
+    char       *reg_produto;
     unsigned long acessos;
 } CtxMarca;
 
@@ -39,7 +39,7 @@ static int cb_acessos_da_marca(Tabela *t, const char *reg, int64_t pos, void *vc
     if (tabela_removido(t, reg)) return 0;
 
     tabela_campo(t, reg, E_PRODUCT_ID, pid);
-    if (tabela_localizar(&produtos, (uint64_t)strtoull(pid, NULL, 10), &L) != 0 || !L.achou ||
+    if (tabela_localizar_rapido(&produtos, (uint64_t)strtoull(pid, NULL, 10), &L) != 0 || !L.achou ||
         tabela_ler_reg(&produtos, L.pos, c->reg_produto) != 0 || tabela_removido(&produtos, c->reg_produto))
         return 0;                                   /* produto não cadastrado */
     tabela_campo(&produtos, c->reg_produto, P_BRAND, brand);
@@ -103,8 +103,8 @@ void consulta_valor_do_item(unsigned long long id_consulta)
     printf("event_type .... %s\n", tipo);
     printf("product_id .... %s\n", pid);
 
-    /* liga ao arquivo de produtos pelo product_id, usando o índice dele */
-    if (tabela_localizar(&produtos, (uint64_t)strtoull(pid, NULL, 10), &L) != 0 || !L.achou ||
+    /* liga ao arquivo de produtos pelo product_id, usando a árvore B+ (ou o índice parcial) */
+    if (tabela_localizar_rapido(&produtos, (uint64_t)strtoull(pid, NULL, 10), &L) != 0 || !L.achou ||
         tabela_ler_reg(&produtos, L.pos, pr) != 0 || tabela_removido(&produtos, pr)) {
         printf("\nO produto %s não está cadastrado no arquivo de produtos; não há valor para mostrar.\n", pid);
         goto fim;

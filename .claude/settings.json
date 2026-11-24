@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l *.c *.h)",
+      "Bash(gcc -Wall -Wextra -O2 main.c tabela.c modelos.c consultas.c arvoreb.c -o trabalho1.exe)"
+    ]
+  }
+}
