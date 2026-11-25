@@ -77,13 +77,13 @@ ordem 3: até 6 registros por nó (8 níveis).
 
 A árvore é montada uma vez, quando o programa abre: percorre o arquivo e insere (product_id, endereço) de cada registro. Depois fica inteira na memória, e cada pesquisa só desce da raiz até a folha. Ela também é refeita na importação, na reorganização e quando a ordem é trocada.
 
-Por ser B+, os nós internos só têm chaves separadoras; os endereços dos registros (número do registro no .dat; byte = (endereço + 1) x tamanho do registro) ficam nas folhas, que são ligadas em lista. A árvore guarda todos os registros do arquivo, inclusive os da extensão e os removidos (eles continuam no mesmo endereço). Uma inserção no menu também insere a chave na árvore.
+Por ser B+, os nós internos só têm chaves separadoras; os endereços dos registros (número do registro no .dat; byte = (endereço + 1) x tamanho do registro) ficam nas folhas, que são ligadas em lista. A árvore guarda os registros ativos do arquivo, inclusive os da extensão; os removidos ficam fora dela.
 
-Menu de produtos: 11 consulta pela árvore (nós visitados na memória + 1 leitura no disco), 12 mostra ordem, níveis, ocupação e o conteúdo dos nós, 13 troca a ordem da árvore (1, 2 ou 3) e a monta de novo. As consultas do menu principal usam a árvore para achar o produto.
+Menu de produtos: a opção 5 (Consultas) pesquisa um product_id pela pesquisa binária, pelo índice parcial em arquivo, pelo índice parcial carregado em memória (os níveis do .idx são lidos uma vez para a RAM e a descida não lê mais o .idx) ou pela árvore B+, mostrando o tempo de cada uma, e tem uma opção que compara os quatro. A opção 10 mostra ordem, níveis, ocupação e o conteúdo dos nós; a 11 troca a ordem da árvore (1, 2 ou 3) e a monta de novo. As consultas do menu principal usam a árvore para achar o produto.
 
 Índice hash em memória (arquivo de pessoas, coluna product_id)
 
-O arquivo de pessoas tem um índice em memória com tabela hash sobre product_id, que não é a chave de ordenação (a chave é id_consulta). Fica em hash.h e hash.c. A tabela é montada ao abrir o programa, lendo o pessoas.dat em lotes de 4096 registros, e refeita na importação e na reorganização. Uma inserção no menu também entra no hash.
+O arquivo de pessoas tem um índice em memória com tabela hash sobre product_id, que não é a chave de ordenação (a chave é id_consulta). Fica em hash.h e hash.c. A tabela é montada ao abrir o programa, lendo o pessoas.dat em lotes de 4096 registros, e refeita na importação, na reorganização e a cada inserção ou remoção. Registros removidos não entram no hash.
 
 Função hash: método da divisão, h(k) = k mod M, com M primo. A tabela começa com cerca de 1/8 do número de registros em baldes (131101 para 1.048.577 eventos).
 
@@ -91,11 +91,22 @@ Valores repetidos: o mesmo product_id aparece em muitos eventos (há 67.356 valo
 
 Resolução de colisões: encadeamento separado. Cada balde é uma lista ligada de nós; quando dois product_id diferentes caem no mesmo balde, o novo nó entra no início da lista. Na busca, o programa calcula h(k) e percorre só a lista daquele balde. Se o fator de carga (valores distintos / M) passar de 1, a tabela cresce para o primeiro primo maior ou igual a 2M e os nós são redistribuídos (rehash). Com os dados atuais: fator de carga 0,51, 11.430 baldes com colisão, maior cadeia com 5 nós e 1,22 comparações em média por busca.
 
-Menu de pessoas: 11 consulta por product_id (mostra o balde, as comparações e os registros; 1 acesso ao disco por registro mostrado), 12 mostra a função, o fator de carga, as colisões e a distribuição dos baldes.
+Menu de pessoas: a opção 5 (Consultas) pesquisa id_consulta pela pesquisa binária ou pelo índice parcial em arquivo, e product_id pela leitura do arquivo inteiro ou pela tabela hash, mostrando o tempo de cada uma; há também uma opção que compara arquivo x hash. A opção 10 mostra a função, o fator de carga, as colisões e a distribuição dos baldes.
+
+Criptografia dos arquivos de dados (XOR)
+
+Os arquivos de dados ficam sempre criptografados. Ao abrir, se algum .dat estiver em claro (por exemplo, um arquivo de versão anterior), o programa o criptografa uma vez e mostra o tempo; a importação de CSV também grava cifrado. Não há opção para descriptografar o arquivo. A chave é a letra 'A' (0x41 = 0100 0001): cada byte do registro é gravado como byte XOR 'A'. Por exemplo, 's' (0111 0011) XOR 'A' (0100 0001) = '2' (0011 0010). Para ler, faz-se o mesmo XOR: '2' XOR 'A' = 's', porque (x XOR k) XOR k = x. Assim a mesma operação cifra e decifra, sem perda nenhuma. O '
+' do fim do registro não é cifrado, e o tamanho do registro não muda; por isso posições, elos e índices continuam valendo e não precisam ser refeitos.
+
+O cabeçalho (registro 0) fica sempre em claro e guarda a flag "cifrado". Com o arquivo criptografado, não é preciso descriptografar o arquivo para consultar: cada leitura decifra só o registro lido, na memória, e cada gravação (inserir, remover, reorganizar, importar) cifra antes de gravar. As varreduras que só olham uma coluna (leitura do arquivo inteiro por product_id e montagem da hash) decifram só essa coluna e o byte delete. Criptografar levou cerca de 2 ms para produtos.dat e 40 ms para pessoas.dat. É uma cifra didática e fraca: com uma chave de 1 letra, quem souber um único byte do original descobre a chave (byte cifrado XOR byte original = 'A'). Além disso, a chave fica no código e os arquivos .idx (que têm as chaves) não são cifrados.
+
+Tempo de criação dos índices
+
+Ao abrir, o programa carrega na memória o índice parcial de cada arquivo (todos os níveis do .idx), a árvore B+ de produtos e a tabela hash de pessoas, e mostra quanto tempo cada um levou. Os mesmos tempos aparecem depois de Importar (opção 1) e de Reorganizar (opção 8), que refazem o .idx, a cópia em memória, a árvore e a hash; ao trocar a ordem da árvore (opção 11) é mostrado o tempo de montá-la; e a opção 9 (Informações) mostra os tempos da última vez que foram feitos. Valores medidos: pessoas.idx refeito em ~30 ms, hash de pessoas ~50 ms, produtos.idx ~2 ms, árvore B+ de produtos ~130 ms, cópia do índice em memória menos de 0,1 ms.
 
 Inserção, remoção e reconstrução do índice:
 Inserção: o registro novo vai para o fim do arquivo (extensão), sem reescrever nada. Ele é ligado pelo campo elo a uma cadeia ordenada por chave, que parte do registro da área principal de maior chave menor que a dele (ou do cab_elo do cabeçalho, se a chave for menor que todas). Assim a busca encontra o registro seguindo os elos. No menu, valor grande demais para o campo ou inválido gera erro e o programa pede o valor de novo. Chave já ativa é recusada. Chave que existia removida é reativada no mesmo lugar.
-Remoção: só troca o campo delete de 0 para 1 (1 byte alterado). O registro continua no arquivo para manter a ordenação e as cadeias. As buscas o mostram como removido e as consultas o ignoram.
+Remoção: no arquivo, só troca o campo delete de 0 para 1 (1 byte alterado). O registro continua no arquivo para manter a ordenação e as cadeias. Depois de remover ou inserir um registro, o programa refaz o .idx, a cópia do índice em memória, a árvore B+ e a tabela hash (que guardam só os registros ativos) e mostra o tempo de cada um. Assim o registro removido não é mais achado; nas pesquisas pelo arquivo (binária e índice parcial), que ainda chegam até ele, aparece como "não encontrado (foi removido)".
 Reconstrução do índice: o índice cobre só a área principal, que não muda com inserções e remoções. Por isso ele não é refeito a cada operação. A reconstrução acontece na reorganização (opção 9 do menu): o programa percorre a ordem lógica (área principal e cadeias), grava um arquivo novo só com os registros ativos, já ordenados e sem elos, troca o arquivo e refaz o índice.
 Importação: linhas fora de ordem, com chave repetida ou com valor inválido não entram. Elas são gravadas em <arquivo>.dat.rejeitados.csv e contadas no resumo.
 Consultas

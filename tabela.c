@@ -5,6 +5,26 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
+double tabela_relogio_ms(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
+}
 
 /* Posicionamento 64 bits. No Windows usa fsetpos/fgetpos (padrão C; fpos_t é inteiro de 64 bits
  * no MSVCRT), que funcionam até em MinGW antigo sem _fseeki64/_ftelli64. */
@@ -64,7 +84,43 @@ static void loc_init(Loc *L)
     L->ant_ext = -1;
 }
 
-int tabela_ler_reg(Tabela *t, int64_t pos, char *buf)
+/* ======================================================================
+ *  Criptografia XOR
+ *
+ *  Chave: a letra 'A' (0x41 = 0100 0001). Cada byte do registro é gravado como
+ *      byte_no_disco = byte_original ^ 'A'
+ *  e, ao ler, volta com o mesmo XOR, porque (x ^ 'A') ^ 'A' = x: sem perda nenhuma.
+ *  Exemplo: 's' (0111 0011) ^ 'A' (0100 0001) = '2' (0011 0010); '2' ^ 'A' = 's'.
+ *  O último byte ('\n') não é cifrado, e o tamanho do registro não muda.
+ * ====================================================================== */
+
+#define CHAVE_XOR 'A'
+
+/* aplica o XOR nos bytes [ini, ini+n) de um registro; d aponta para o byte 'ini'.
+ * (pos não entra na conta com chave de 1 letra; fica no parâmetro para manter a interface) */
+static void xor_reg(const Tabela *t, int64_t pos, int ini, char *d, int n)
+{
+    (void)pos;
+    for (int j = 0; j < n; j++) {
+        if (ini + j >= t->tam_reg - 1) break;                   /* '\n' fica em claro */
+        d[j] ^= CHAVE_XOR;
+    }
+}
+
+void tabela_decifrar_reg(const Tabela *t, int64_t pos, char *reg)
+{
+    if (t->cifrado) xor_reg(t, pos, 0, reg, t->tam_reg);
+}
+
+/* decifra só o campo i e o byte delete (varreduras que olham uma coluna não decifram o resto) */
+void tabela_decifrar_campo(const Tabela *t, int64_t pos, char *reg, int i)
+{
+    if (!t->cifrado) return;
+    xor_reg(t, pos, t->off[i], reg + t->off[i], t->tam[i]);
+    xor_reg(t, pos, t->off_del, reg + t->off_del, 1);
+}
+
+int tabela_ler_bruto(Tabela *t, int64_t pos, char *buf)
 {
     if (pos < 0) return -1;
     if (SEEK64(t->f, (long long)(pos + 1) * t->tam_reg, SEEK_SET) != 0) return -1;
@@ -73,10 +129,21 @@ int tabela_ler_reg(Tabela *t, int64_t pos, char *buf)
     return 0;
 }
 
+int tabela_ler_reg(Tabela *t, int64_t pos, char *buf)
+{
+    if (tabela_ler_bruto(t, pos, buf) != 0) return -1;
+    tabela_decifrar_reg(t, pos, buf);                           /* só este registro, na memória */
+    return 0;
+}
+
 static int escrever_bytes(Tabela *t, int64_t pos, int off, const char *d, int n)
 {
+    char tmp[1024];                                             /* registro tem bem menos que isso */
+    if (n > (int)sizeof tmp) return -1;
+    memcpy(tmp, d, (size_t)n);
+    if (t->cifrado) xor_reg(t, pos, off, tmp, n);               /* cifra antes de gravar */
     if (SEEK64(t->f, (long long)(pos + 1) * t->tam_reg + off, SEEK_SET) != 0) return -1;
-    if (fwrite(d, 1, (size_t)n, t->f) != (size_t)n) return -1;
+    if (fwrite(tmp, 1, (size_t)n, t->f) != (size_t)n) return -1;
     fflush(t->f);
     return 0;
 }
@@ -148,6 +215,7 @@ static void cab_montar(const Tabela *t, char *b, int64_t np, int64_t ne, int64_t
     memcpy(b + TAM_CAB, &ne, TAM_CAB);
     memcpy(b + 2 * TAM_CAB, &ce, TAM_CAB);
     memcpy(b + 3 * TAM_CAB, MAGIA_DADOS, 8);
+    b[4 * TAM_CAB] = (char)(t->cifrado ? 1 : 0);                /* flag de criptografia */
     b[t->tam_reg - 1] = '\n';
     b[t->tam_reg] = '\0';
 }
@@ -180,6 +248,7 @@ static int cab_ler(Tabela *t)
     memcpy(&t->n_princ, b, TAM_CAB);
     memcpy(&t->n_ext, b + TAM_CAB, TAM_CAB);
     memcpy(&t->cab_elo, b + 2 * TAM_CAB, TAM_CAB);
+    t->cifrado = b[4 * TAM_CAB] == 1;
     free(b);
     return 0;
 }
@@ -297,7 +366,7 @@ static int64_t ultimo_menor_igual(const EntradaIdx *v, int64_t n, uint64_t chave
     return r;
 }
 
-int tabela_indice_construir(Tabela *t)
+static int indice_construir(Tabela *t)
 {
     CabIdx c;
     char *buf;
@@ -306,6 +375,7 @@ int tabela_indice_construir(Tabela *t)
 
     if (t->fi) { fclose(t->fi); t->fi = NULL; }
     t->idx_ok = 0;
+    free(t->idx_mem); t->idx_mem = NULL;            /* a cópia em memória fica desatualizada */
 
     memset(&c, 0, sizeof c);
     memcpy(c.magia, MAGIA, 8);
@@ -359,6 +429,17 @@ int tabela_indice_construir(Tabela *t)
     fflush(t->fi);
     t->idx_ok = 1;
     return 0;
+}
+
+/* Refaz o .idx, medindo o tempo, e já carrega a nova versão em memória */
+int tabela_indice_construir(Tabela *t)
+{
+    double t0 = tabela_relogio_ms();
+    int rc = indice_construir(t);
+    t->ms_indice = tabela_relogio_ms() - t0;
+    t->idx_refeito = 1;
+    if (rc == 0) tabela_indice_mem_carregar(t);
+    return rc;
 }
 
 /* Carrega o índice gravado em disco; devolve 1 se está válido, 0 se precisa reconstruir */
@@ -430,10 +511,19 @@ int tabela_abrir(Tabela *t)
         cab_escrever(t);
     }
 
-    if (!indice_carregar(t)) {
-        printf("  [%s] índice ausente ou desatualizado: reconstruindo '%s'...\n", t->nome, t->arq_indice);
-        if (tabela_indice_construir(t) != 0) return -1;
+    {
+        double t0 = tabela_relogio_ms();
+        int ok = indice_carregar(t);
+        t->ms_indice = tabela_relogio_ms() - t0;
+        t->idx_refeito = 0;
+        if (!ok) {
+            printf("  [%s] índice ausente ou desatualizado: reconstruindo '%s'...\n", t->nome, t->arq_indice);
+            if (tabela_indice_construir(t) != 0) return -1;
+        }
     }
+    /* o índice parcial é sempre carregado em memória ao abrir */
+    if (tabela_indice_mem_carregar(t) != 0)
+        printf("  [%s] aviso: não foi possível carregar o índice parcial em memória\n", t->nome);
     if (t->usa_hash && tabela_hash_construir(t) != 0)
         printf("  [%s] aviso: não foi possível montar a tabela hash (%s)\n", t->nome, t->erro);
     if (t->usa_arvore && tabela_arvore_construir(t, t->ordem_arvore) != 0)
@@ -447,6 +537,7 @@ void tabela_fechar(Tabela *t)
     if (t->hash)   { th_destruir(t->hash);   t->hash = NULL; }
     /* o índice é gravado sempre que muda; aqui só garantimos que existe e está coerente */
     if (t->f && !t->idx_ok) tabela_indice_construir(t);
+    free(t->idx_mem); t->idx_mem = NULL;
     if (t->fi) { fclose(t->fi); t->fi = NULL; }
     if (t->f)  { fclose(t->f);  t->f  = NULL; }
 }
@@ -509,11 +600,11 @@ int tabela_busca_binaria(Tabela *t, uint64_t chave, Loc *L)
  *    Desce do topo até o nível 1, lendo 1 bloco de até k entradas por nível; depois lê
  *    1 bloco de até k registros do arquivo de dados e procura nele; se não achar, segue a
  *    cadeia de extensão. */
-int tabela_busca_indice(Tabela *t, uint64_t chave, Loc *L)
+static int busca_indice(Tabela *t, uint64_t chave, Loc *L, int em_memoria)
 {
     uint64_t k;
     int nivel;
-    int64_t e = -1;
+    int64_t e = -1, pos_e = 0;
     uint64_t ini, qtd;
     EntradaIdx *blk = NULL;
     char *dblk = NULL, *buf = NULL;
@@ -532,23 +623,32 @@ int tabela_busca_indice(Tabela *t, uint64_t chave, Loc *L)
         ini = 0;
         qtd = t->idx.n[nivel];                         /* o topo cabe inteiro num bloco */
         for (;;) {
-            if (ler_entradas(t, nivel, ini, qtd, blk) != 0) goto fim;
+            const EntradaIdx *v;
+            if (em_memoria) {                          /* o bloco já está na RAM: só aponta para ele */
+                v = t->idx_mem + (t->idx.off[nivel] - t->idx.off[0]) / sizeof(EntradaIdx) + ini;
+            } else {
+                if (ler_entradas(t, nivel, ini, qtd, blk) != 0) goto fim;
+                v = blk;
+            }
             L->cmp_idx++;
-            e = ultimo_menor_igual(blk, (int64_t)qtd, chave);
+            e = ultimo_menor_igual(v, (int64_t)qtd, chave);
+            if (e >= 0) pos_e = v[e].pos;
             if (e < 0 || nivel == 0) break;            /* menor que todas, ou chegou ao nível 1 */
-            ini = (uint64_t)blk[e].pos;                /* bloco do nível de baixo */
+            ini = (uint64_t)pos_e;                     /* bloco do nível de baixo */
             qtd = t->idx.n[nivel - 1] - ini;
             if (qtd > k) qtd = k;
             nivel--;
         }
         if (e >= 0) {
-            int64_t r0 = blk[e].pos;
+            int64_t r0 = pos_e;
             int64_t n_reg = t->n_princ - r0;
             int64_t lo = 0, hi;
             if (n_reg > (int64_t)k) n_reg = (int64_t)k;
             if (SEEK64(t->f, (long long)(r0 + 1) * t->tam_reg, SEEK_SET) != 0) goto fim;
             if (fread(dblk, (size_t)t->tam_reg, (size_t)n_reg, t->f) != (size_t)n_reg) goto fim;
             L->cmp_dados++;                            /* 1 leitura traz o bloco todo */
+            for (int64_t j = 0; j < n_reg; j++)        /* decifra o bloco na memória */
+                tabela_decifrar_reg(t, r0 + j, dblk + (size_t)j * (size_t)t->tam_reg);
             hi = n_reg - 1;
             while (lo <= hi) {                         /* busca binária dentro do bloco, na memória */
                 int64_t mid = lo + (hi - lo) / 2;
@@ -568,6 +668,40 @@ fim:
     free(dblk);
     free(buf);
     return rc;
+}
+
+int tabela_busca_indice(Tabela *t, uint64_t chave, Loc *L)
+{
+    return busca_indice(t, chave, L, 0);
+}
+
+/* Lê todos os níveis do arquivo de índice de uma vez para a memória */
+int tabela_indice_mem_carregar(Tabela *t)
+{
+    uint64_t total = 0;
+    double t0;
+    if (t->idx_mem) return 0;
+    if (!t->idx_ok) return -1;
+    t0 = tabela_relogio_ms();
+    for (uint64_t i = 0; i < t->idx.n_niveis; i++) total += t->idx.n[i];
+    t->idx_mem = (EntradaIdx *)malloc((size_t)(total ? total : 1) * sizeof(EntradaIdx));
+    if (!t->idx_mem) return -1;
+    if (total && (SEEK64(t->fi, (long long)t->idx.off[0], SEEK_SET) != 0 ||
+                  fread(t->idx_mem, sizeof(EntradaIdx), (size_t)total, t->fi) != (size_t)total)) {
+        free(t->idx_mem); t->idx_mem = NULL;
+        return -1;
+    }
+    t->idx_mem_n = total;
+    t->ms_indice_mem = tabela_relogio_ms() - t0;
+    return 0;
+}
+
+/* Mesma descida do índice parcial, mas nos níveis já carregados em memória:
+ * L->cmp_idx = níveis percorridos na memória, L->cmp_dados = leitura do bloco de dados */
+int tabela_busca_indice_mem(Tabela *t, uint64_t chave, Loc *L)
+{
+    if (tabela_indice_mem_carregar(t) != 0) return tabela_busca_indice(t, chave, L);
+    return busca_indice(t, chave, L, 1);
 }
 
 int tabela_localizar(Tabela *t, uint64_t chave, Loc *L)
@@ -606,12 +740,7 @@ int tabela_inserir(Tabela *t, const char *const vals[])
         /* chave existia mas estava removida: reativa no mesmo lugar, preservando o elo */
         montar_registro(t, vals, 0, tabela_elo(t, old), buf);
         if (escrever_reg(t, L.pos, buf) != 0) goto fim;
-        if (t->hash) {                                    /* o valor da coluna pode ter mudado */
-            th_remover(t->hash, tabela_campo_u64(t, old, t->campo_hash), L.pos);
-            if (th_inserir(t->hash, tabela_campo_u64(t, buf, t->campo_hash), L.pos) < 0) {
-                th_destruir(t->hash); t->hash = NULL;
-            }
-        }
+        tabela_refazer_indices(t);                       /* volta a ser achado pela árvore/hash */
         snprintf(t->erro, sizeof t->erro, "esse registro já existia como removido e foi reativado");
         r = 1;
         goto fim;
@@ -628,17 +757,10 @@ int tabela_inserir(Tabela *t, const char *const vals[])
 
     t->n_ext++;
     r = cab_escrever(t);
-    if (r == 0 && t->hash && th_inserir(t->hash, tabela_campo_u64(t, buf, t->campo_hash), novo) < 0) {
-        th_destruir(t->hash);                            /* sem memória: hash deixa de valer */
-        t->hash = NULL;
+    if (r == 0) {
+        tabela_refazer_indices(t);                       /* índices em memória passam a ter o novo */
+        snprintf(t->erro, sizeof t->erro, "registro inserido na área de extensão e ligado pelo campo elo");
     }
-    if (r == 0 && t->arvore && bp_inserir(t->arvore, chave, novo) < 0) {
-        bp_destruir(t->arvore);                          /* sem memória: árvore deixa de valer */
-        t->arvore = NULL;
-    }
-    if (r == 0)
-        snprintf(t->erro, sizeof t->erro, "registro inserido na área de extensão e ligado pelo campo elo%s",
-                 t->arvore ? " (e incluído na árvore B+)" : "");
 fim:
     free(buf);
     free(old);
@@ -661,9 +783,12 @@ int tabela_remover(Tabela *t, uint64_t chave)
         snprintf(t->erro, sizeof t->erro, "o registro já estava removido");
         goto fim;
     }
-    r = set_delete(t, L.pos, 1);
-    if (r == 0)
+    r = set_delete(t, L.pos, 1);                       /* no arquivo: só o campo delete muda */
+    if (r == 0) {
+        fflush(t->f);
+        tabela_refazer_indices(t);                       /* índices em memória sem o removido */
         snprintf(t->erro, sizeof t->erro, "registro removido (campo delete marcado como 1)");
+    }
 fim:
     free(buf);
     return r;
@@ -725,6 +850,7 @@ static int cb_reorg(Tabela *t, const char *reg, int64_t pos, void *vctx)
     memcpy(tmp, reg, (size_t)t->tam_reg);
     tmp[t->off_del] = 0;
     memset(tmp + t->off_elo, 0, TAM_ELO);                      /* elo zerado */
+    if (t->cifrado) xor_reg(t, c->gravados, 0, tmp, t->tam_reg); /* cifra na posição nova */
     if (fwrite(tmp, 1, (size_t)t->tam_reg, c->out) != (size_t)t->tam_reg) c->ok = 0;
     free(tmp);
     c->gravados++;
@@ -792,11 +918,22 @@ int tabela_reorganizar(Tabela *t, long *incorporados, long *descartados)
 static int cb_arvore(Tabela *t, const char *reg, int64_t pos, void *vctx)
 {
     ArvoreBP *a = (ArvoreBP *)vctx;
+    if (tabela_removido(t, reg)) return 0;                    /* removido não entra na árvore */
     return bp_inserir(a, tabela_chave(t, reg), pos) < 0;      /* para se faltar memória */
+}
+
+int tabela_refazer_indices(Tabela *t)
+{
+    int r = 0;
+    if (tabela_indice_construir(t) != 0) r = -1;             /* também recarrega a cópia em memória */
+    if (t->usa_arvore && tabela_arvore_construir(t, t->ordem_arvore) != 0) r = -1;
+    if (t->usa_hash && tabela_hash_construir(t) != 0) r = -1;
+    return r;
 }
 
 int tabela_arvore_construir(Tabela *t, int ordem)
 {
+    double t0 = tabela_relogio_ms();
     ArvoreBP *a = bp_criar(ordem);
     if (!a) { snprintf(t->erro, sizeof t->erro, "memória insuficiente para a árvore B+"); return -1; }
 
@@ -809,6 +946,7 @@ int tabela_arvore_construir(Tabela *t, int ordem)
     if (t->arvore) bp_destruir(t->arvore);
     t->arvore = a;
     t->ordem_arvore = ordem;            /* importação/reorganização refazem com a ordem escolhida */
+    t->ms_arvore = tabela_relogio_ms() - t0;
     return 0;
 }
 
@@ -846,6 +984,7 @@ int tabela_hash_construir(Tabela *t)
     int64_t total = t->n_princ + t->n_ext;
     TabelaHash *h;
     char *lote;
+    double t0 = tabela_relogio_ms();
 
     if (t->campos[t->campo_hash].tipo != T_NUM) {
         snprintf(t->erro, sizeof t->erro, "a coluna do hash precisa ser numérica");
@@ -865,17 +1004,54 @@ int tabela_hash_construir(Tabela *t)
     for (int64_t pos = 0; pos < total; ) {
         int64_t qtd = total - pos < HASH_LOTE ? total - pos : HASH_LOTE;
         if (fread(lote, (size_t)t->tam_reg, (size_t)qtd, t->f) != (size_t)qtd) goto erro;
-        for (int64_t i = 0; i < qtd; i++, pos++)
-            if (th_inserir(h, tabela_campo_u64(t, lote + i * t->tam_reg, t->campo_hash), pos) < 0) goto erro;
+        for (int64_t i = 0; i < qtd; i++, pos++) {
+            char *reg = lote + i * t->tam_reg;
+            tabela_decifrar_campo(t, pos, reg, t->campo_hash);
+            if (tabela_removido(t, reg)) continue;                 /* removido não entra no hash */
+            if (th_inserir(h, tabela_campo_u64(t, reg, t->campo_hash), pos) < 0) goto erro;
+        }
     }
     free(lote);
     if (t->hash) th_destruir(t->hash);
     t->hash = h;
+    t->ms_hash = tabela_relogio_ms() - t0;
     return 0;
 erro:
     th_destruir(h);
     free(lote);
     snprintf(t->erro, sizeof t->erro, "falha ao montar a tabela hash");
+    return -1;
+}
+
+/* ======================================================================
+ *  Criptografar / descriptografar o arquivo inteiro (XOR é o mesmo nos dois sentidos)
+ * ====================================================================== */
+
+#define CIFRA_LOTE 4096
+
+int tabela_alternar_cifra(Tabela *t)
+{
+    int64_t total = t->n_princ + t->n_ext;
+    char *lote = (char *)malloc((size_t)CIFRA_LOTE * (size_t)t->tam_reg);
+    if (!lote) { snprintf(t->erro, sizeof t->erro, "memória insuficiente"); return -1; }
+
+    for (int64_t pos = 0; pos < total; ) {
+        int64_t q = total - pos < CIFRA_LOTE ? total - pos : CIFRA_LOTE;
+        long long off = (long long)(pos + 1) * t->tam_reg;
+        if (SEEK64(t->f, off, SEEK_SET) != 0 ||
+            fread(lote, (size_t)t->tam_reg, (size_t)q, t->f) != (size_t)q) goto erro;
+        for (int64_t i = 0; i < q; i++)
+            xor_reg(t, pos + i, 0, lote + (size_t)i * (size_t)t->tam_reg, t->tam_reg);
+        if (SEEK64(t->f, off, SEEK_SET) != 0 ||
+            fwrite(lote, (size_t)t->tam_reg, (size_t)q, t->f) != (size_t)q) goto erro;
+        pos += q;
+    }
+    free(lote);
+    t->cifrado = !t->cifrado;
+    return cab_escrever(t);                    /* grava a flag nova no cabeçalho */
+erro:
+    free(lote);
+    snprintf(t->erro, sizeof t->erro, "erro de leitura/escrita em '%s'", t->arq_dados);
     return -1;
 }
 
@@ -933,6 +1109,7 @@ int tabela_importar_csv(Tabela *t, const char *csv, ImportStats *st)
     t->f = fopen(t->arq_dados, "w+b");
     if (!t->f) { fclose(in); free(linha); free(orig); free(buf); return -1; }
     t->n_princ = t->n_ext = t->cab_elo = 0;
+    t->cifrado = 1;                                             /* dados sempre gravados cifrados */
     cab_escrever(t);                                            /* deixa o cursor após o cabeçalho */
 
     snprintf(st->arq_rejeitados, sizeof st->arq_rejeitados, "%s.rejeitados.csv", t->arq_dados);
@@ -960,6 +1137,7 @@ int tabela_importar_csv(Tabela *t, const char *csv, ImportStats *st)
             ult = k;
             tem_ult = 1;
         }
+        if (t->cifrado) xor_reg(t, st->gravados, 0, buf, t->tam_reg);
         if (fwrite(buf, 1, (size_t)t->tam_reg, t->f) != (size_t)t->tam_reg) {
             snprintf(t->erro, sizeof t->erro, "erro de escrita em '%s'", t->arq_dados);
             fclose(in); free(linha); free(orig); free(buf);

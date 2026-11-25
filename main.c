@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -81,6 +82,10 @@ static void aguardar_enter(void)
     ler_linha("\nPressione Enter para voltar ao menu...", b, sizeof b);
 }
 
+/* definidas mais abaixo, junto das consultas */
+static void mostrar_tempos(Tabela *t);                  /* tempos de criação dos índices */
+static const char *fmt_tempo(double ms, char *b);       /* ms -> "12.3 µs" / "4.56 ms" / "1.20 s" */
+
 /* Ações do menu de tabela */
 
 static void acao_importar(Tabela *t)
@@ -109,6 +114,8 @@ static void acao_importar(Tabela *t)
         printf("As linhas rejeitadas foram salvas em %s\n", st.arq_rejeitados);
     printf("Índice parcial reconstruído em %s (%llu nível(is), 1 entrada a cada %llu).\n",
            t->arq_indice, (unsigned long long)t->idx.n_niveis, (unsigned long long)t->k);
+    printf("\nTempo para refazer os índices:\n");
+    mostrar_tempos(t);
 }
 
 /* imprime os registros físicos [ini, fim) */
@@ -183,71 +190,6 @@ static void acao_intervalo_logico(Tabela *t)
     aguardar_enter();
 }
 
-static void mostrar_loc(const Loc *L, int por_indice)
-{
-    if (por_indice)
-        printf("Acessos ao disco: %ld no arquivo de índice e %ld no arquivo de dados\n", L->cmp_idx, L->cmp_dados + L->cmp_ext);
-    else
-        printf("Acessos ao disco no arquivo de dados: %ld\n", L->cmp_dados + L->cmp_ext);
-}
-
-enum { BUSCA_BINARIA = 0, BUSCA_INDICE = 1, BUSCA_ARVORE = 2 };
-
-static void acao_busca(Tabela *t, int metodo)
-{
-    unsigned long long chave;
-    char prompt[96];
-    Loc L;
-    char *buf;
-    int por_indice = metodo == BUSCA_INDICE;
-
-    snprintf(prompt, sizeof prompt, "Valor de %s: ", t->campos[t->idx_chave].nome);
-    if (!ler_u64(prompt, 0, 0, &chave)) return;
-
-    if (metodo == BUSCA_ARVORE) {
-        if (!t->arvore) { printf("Árvore B+ indisponível.\n"); return; }
-        tabela_busca_arvore(t, chave, &L);
-        printf("\nMétodo: árvore B+ em memória (raiz até a folha) + 1 seek no arquivo de dados\n");
-        printf("Nós visitados na memória: %ld (altura da árvore)\n", L.cmp_idx);
-        if (!L.achou) { printf("Chave %llu não encontrada (nenhum acesso ao disco).\n", chave); return; }
-        printf("Endereço na folha: registro %lld (byte %lld do arquivo)\n",
-               (long long)L.pos, (long long)(L.pos + 1) * t->tam_reg);
-        buf = tabela_novo_buf(t);
-        if (!buf) return;
-        if (tabela_ler_reg(t, L.pos, buf) == 0) {
-            tabela_imprimir_cab(t);
-            tabela_imprimir_reg(t, buf, L.pos);
-            if (tabela_removido(t, buf)) printf("(este registro está marcado como removido)\n");
-        }
-        printf("Acessos ao disco: 1 (só a leitura do registro)\n");
-        free(buf);
-        return;
-    }
-
-    if (por_indice) {
-        if (!t->idx_ok) { printf("Índice indisponível.\n"); return; }
-        tabela_busca_indice(t, chave, &L);
-    } else {
-        tabela_busca_binaria(t, chave, &L);
-    }
-    printf("\nMétodo: %s\n", por_indice ? "índice parcial (2 níveis) + seek no arquivo de dados"
-                                        : "pesquisa binária direto no arquivo de dados");
-    if (!L.achou) {
-        printf("Chave %llu não encontrada.\n", chave);
-        mostrar_loc(&L, por_indice);
-        return;
-    }
-    buf = tabela_novo_buf(t);
-    if (!buf) return;
-    if (tabela_ler_reg(t, L.pos, buf) == 0) {
-        tabela_imprimir_cab(t);
-        tabela_imprimir_reg(t, buf, L.pos);
-        if (tabela_removido(t, buf)) printf("(este registro está marcado como removido)\n");
-    }
-    mostrar_loc(&L, por_indice);
-    free(buf);
-}
-
 /* 1 se já existe um registro ATIVO com essa chave */
 static int chave_ativa_existe(Tabela *t, const char *v)
 {
@@ -289,7 +231,9 @@ static void acao_inserir(Tabela *t)
     if (r < 0) printf("Não inserido: %s\n", t->erro);
     else {
         printf("OK: %s.\n", t->erro);
-        if (r == 0) printf("A área de extensão agora tem %lld registro(s). Use 'Reorganizar' (opção 9) para incorporá-los ao arquivo principal.\n", (long long)t->n_ext);
+        if (r == 0) printf("A área de extensão agora tem %lld registro(s). Use 'Reorganizar' (opção 8) para incorporá-los ao arquivo principal.\n", (long long)t->n_ext);
+        printf("\nTempo para refazer os índices:\n");
+        mostrar_tempos(t);
     }
 }
 
@@ -299,8 +243,13 @@ static void acao_remover(Tabela *t)
     char prompt[96];
     snprintf(prompt, sizeof prompt, "Valor de %s a remover: ", t->campos[t->idx_chave].nome);
     if (!ler_u64(prompt, 0, 0, &chave)) return;
-    if (tabela_remover(t, chave) == 0) printf("OK: %s.\n", t->erro);
-    else printf("Não removido: %s\n", t->erro);
+    if (tabela_remover(t, chave) == 0) {
+        printf("OK: %s. O registro continua no arquivo, mas sai dos índices em memória.\n", t->erro);
+        printf("\nTempo para refazer os índices:\n");
+        mostrar_tempos(t);
+    } else {
+        printf("Não removido: %s\n", t->erro);
+    }
 }
 
 static void acao_reorganizar(Tabela *t)
@@ -309,12 +258,15 @@ static void acao_reorganizar(Tabela *t)
     if (tabela_reorganizar(t, &inc, &desc) != 0) { printf("Erro: %s\n", t->erro); return; }
     printf("Reorganizado: %lld registros na área principal, %ld vindos da extensão, %ld removidos descartados.\n",
            (long long)t->n_princ, inc, desc);
-    printf("Índice parcial reconstruído.\n");
+    printf("\nTempo para refazer os índices:\n");
+    mostrar_tempos(t);
 }
 
 static void acao_info(Tabela *t)
 {
     tabela_info(t);
+    printf("\nTempo de criação dos índices (última vez que foram feitos):\n");
+    mostrar_tempos(t);
     tabela_indice_listar(t, 20);
 }
 
@@ -337,7 +289,7 @@ static void arvore_info(Tabela *t)
            a->ordem, a->max_chaves, a->min_chaves);
     printf("Nó interno ................. até %d chaves separadoras e %d filhos\n", a->max_chaves, a->max_chaves + 1);
     printf("Folha ...................... até %d elementos (chave, endereço do registro)\n", a->max_chaves);
-    printf("Chaves indexadas ........... %ld (registros do arquivo, inclusive extensão e removidos)\n", a->n_chaves);
+    printf("Chaves indexadas ........... %ld (registros ativos do arquivo, inclusive os da extensão)\n", a->n_chaves);
     printf("Altura ..................... %d nível(is)  => %d nó(s) visitado(s) por busca\n", a->altura, a->altura);
     printf("Nós ........................ %ld (%ld folhas, %ld internos), %lu bytes cada = %lu KiB de memória\n",
            a->n_nos, a->n_folhas, a->n_nos - a->n_folhas, (unsigned long)a->tam_no,
@@ -372,6 +324,10 @@ static void acao_arvore_ordem(Tabela *t)
     }
     printf("Montando a árvore de ordem %llu com todos os registros do arquivo...\n", ordem);
     if (tabela_arvore_construir(t, (int)ordem) != 0) { printf("Erro: %s\n", t->erro); return; }
+    {
+        char b[32];
+        printf("Árvore montada em %s.\n", fmt_tempo(t->ms_arvore, b));
+    }
     arvore_info(t);
 }
 
@@ -388,46 +344,6 @@ static void imprimir_balde(const TabelaHash *h, size_t b, uint64_t destaque)
                no->chave == destaque ? "*" : "");
     }
     printf("\n");
-}
-
-static void acao_hash_busca(Tabela *t)
-{
-    TabelaHash *h = t->hash;
-    const NoHash *no;
-    unsigned long long valor, lim;
-    char prompt[96], *buf;
-    int comp;
-    long mostrados = 0, removidos = 0;
-    const char *col = t->campos[t->campo_hash].nome;
-
-    if (!h) { printf("Tabela hash indisponível.\n"); return; }
-    snprintf(prompt, sizeof prompt, "Valor de %s: ", col);
-    if (!ler_u64(prompt, 0, 0, &valor)) return;
-
-    no = th_buscar(h, valor, &comp);
-    printf("\nMétodo: tabela hash em memória sobre %s (encadeamento separado)\n", col);
-    printf("h(%llu) = %llu mod %lu = balde %lu\n", valor, valor, (unsigned long)h->m,
-           (unsigned long)th_funcao(h, valor));
-    imprimir_balde(h, th_funcao(h, valor), valor);
-    printf("Comparações na cadeia do balde: %d\n", comp);
-    if (!no) { printf("Nenhum registro com %s = %llu (nenhum acesso ao disco).\n", col, valor); return; }
-
-    printf("%d registro(s) com %s = %llu.\n", no->n, col, valor);
-    if (!ler_u64("Quantos mostrar [20]: ", 20, 1, &lim)) return;
-    buf = tabela_novo_buf(t);
-    if (!buf) return;
-    tabela_imprimir_cab(t);
-    for (int i = 0; i < no->n && mostrados < (long)lim; i++) {
-        if (tabela_ler_reg(t, no->end[i], buf) != 0) continue;
-        tabela_imprimir_reg(t, buf, no->end[i]);
-        if (tabela_removido(t, buf)) removidos++;
-        mostrados++;
-    }
-    if (no->n > mostrados) printf("... (mais %ld registro(s) não mostrados)\n", (long)no->n - mostrados);
-    printf("Acessos ao disco: %ld (1 por registro mostrado; o endereço vem da lista do nó)\n", mostrados);
-    if (removidos) printf("%ld dos registros mostrados estão marcados como removidos.\n", removidos);
-    free(buf);
-    aguardar_enter();
 }
 
 static void acao_hash_info(Tabela *t)
@@ -464,6 +380,327 @@ static void acao_hash_info(Tabela *t)
     aguardar_enter();
 }
 
+/* ======================================================================
+ *  Consultas (submenu de cada tabela), sempre com o tempo da pesquisa
+ * ====================================================================== */
+
+/* relógio de alta resolução, em milissegundos */
+static double agora_ms(void)
+{
+    return tabela_relogio_ms();
+}
+
+static const char *fmt_tempo(double ms, char *b)
+{
+    if (ms < 1.0)         snprintf(b, 32, "%.1f µs", ms * 1000.0);
+    else if (ms < 1000.0) snprintf(b, 32, "%.2f ms", ms);
+    else                  snprintf(b, 32, "%.2f s", ms / 1000.0);
+    return b;
+}
+
+static void mostrar_tempos(Tabela *t)
+{
+    char b[32];
+    printf("  %s:\n", t->nome);
+    printf("    Índice parcial (%s) %s %s (%llu nível(is))\n", t->arq_indice,
+           t->idx_refeito ? "refeito em" : "lido do disco em", fmt_tempo(t->ms_indice, b),
+           (unsigned long long)t->idx.n_niveis);
+    if (t->idx_mem)
+        printf("    Índice parcial carregado em memória: %s (%llu entradas, %llu KiB)\n", fmt_tempo(t->ms_indice_mem, b),
+               (unsigned long long)t->idx_mem_n, (unsigned long long)(t->idx_mem_n * sizeof(EntradaIdx) / 1024));
+    if (t->arvore)
+        printf("    Árvore B+ ordem %d: %s (%ld chaves)\n", t->ordem_arvore, fmt_tempo(t->ms_arvore, b), t->arvore->n_chaves);
+    if (t->hash)
+        printf("    Tabela hash sobre %s: %s (%ld registros, %ld valores distintos, %lu baldes)\n",
+               t->campos[t->campo_hash].nome, fmt_tempo(t->ms_hash, b), t->hash->n_enderecos,
+               t->hash->n_chaves, (unsigned long)t->hash->m);
+}
+
+/* imprime 's' numa coluna de 'largura' letras (conta letras acentuadas em UTF-8 como 1) */
+static void coluna(const char *s, int largura, int a_direita)
+{
+    int n = 0;
+    for (const char *c = s; *c; c++)
+        if (((unsigned char)*c & 0xC0) != 0x80) n++;
+    if (a_direita) printf("%*s%s", largura > n ? largura - n : 0, "", s);
+    else           printf("%s%*s", s, largura > n ? largura - n : 0, "");
+}
+
+/* ---------- pela chave (product_id em produtos, id_consulta em pessoas) ---------- */
+
+enum { BUSCA_BINARIA = 0, BUSCA_INDICE = 1, BUSCA_INDICE_MEM = 2, BUSCA_ARVORE = 3 };
+static const char *NOME_BUSCA[] = { "Pesquisa binária (arquivo)", "Índice parcial (arquivo .idx)",
+                                    "Índice parcial (memória)", "Árvore B+ (memória)" };
+
+/* faz a pesquisa e traz o registro encontrado; devolve o tempo em ms */
+static double buscar_chave(Tabela *t, int metodo, uint64_t chave, Loc *L, char *buf)
+{
+    double t0 = agora_ms();
+    if (metodo == BUSCA_BINARIA)     tabela_busca_binaria(t, chave, L);
+    else if (metodo == BUSCA_INDICE) tabela_busca_indice(t, chave, L);
+    else if (metodo == BUSCA_INDICE_MEM) tabela_busca_indice_mem(t, chave, L);
+    else                             tabela_busca_arvore(t, chave, L);
+    if (L->achou && tabela_ler_reg(t, L->pos, buf) == 0 && tabela_removido(t, buf))
+        L->achou = 0;                    /* está no arquivo com delete = 1: não conta como achado (pos fica >= 0) */
+    return agora_ms() - t0;
+}
+
+static void descrever_acessos(int metodo, const Loc *L, char *out, size_t n)
+{
+    long reg = L->pos >= 0 ? 1 : 0;     /* leitura do registro (também quando está removido) */
+    if (metodo == BUSCA_BINARIA)
+        snprintf(out, n, "%ld leitura(s) no arquivo", L->cmp_dados + L->cmp_ext + reg);
+    else if (metodo == BUSCA_INDICE)
+        snprintf(out, n, "%ld leitura(s) no .idx + %ld no arquivo", L->cmp_idx, L->cmp_dados + L->cmp_ext + reg);
+    else if (metodo == BUSCA_INDICE_MEM)
+        snprintf(out, n, "%ld nível(is) na memória + %ld leitura(s) no arquivo", L->cmp_idx, L->cmp_dados + L->cmp_ext + reg);
+    else
+        snprintf(out, n, "%ld nó(s) na memória + %ld leitura no arquivo", L->cmp_idx, reg);
+}
+
+static int metodo_disponivel(Tabela *t, int metodo)
+{
+    if (metodo == BUSCA_INDICE && !t->idx_ok) { printf("Índice parcial indisponível.\n"); return 0; }
+    if (metodo == BUSCA_ARVORE && !t->arvore) { printf("Árvore B+ indisponível.\n"); return 0; }
+    if (metodo == BUSCA_INDICE_MEM && (!t->idx_ok || tabela_indice_mem_carregar(t) != 0)) {
+        printf("Não foi possível carregar o índice parcial em memória.\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void acao_busca(Tabela *t, int metodo)
+{
+    unsigned long long chave;
+    char prompt[96], tempo[32], acessos[96], *buf;
+    Loc L;
+    double ms;
+
+    if (!metodo_disponivel(t, metodo)) return;
+    snprintf(prompt, sizeof prompt, "%s: ", t->campos[t->idx_chave].nome);
+    if (!ler_u64(prompt, 0, 0, &chave)) return;
+    buf = tabela_novo_buf(t);
+    if (!buf) return;
+
+    ms = buscar_chave(t, metodo, chave, &L, buf);
+    descrever_acessos(metodo, &L, acessos, sizeof acessos);
+    printf("\n[%s]\n", NOME_BUSCA[metodo]);
+    if (L.achou) {
+        tabela_imprimir_cab(t);
+        tabela_imprimir_reg(t, buf, L.pos);
+    } else if (L.pos >= 0) {
+        printf("%s %llu não encontrado (foi removido: continua no arquivo com delete = 1).\n",
+               t->campos[t->idx_chave].nome, chave);
+    } else {
+        printf("%s %llu não encontrado.\n", t->campos[t->idx_chave].nome, chave);
+    }
+    printf("Tempo: %s | %s\n", fmt_tempo(ms, tempo), acessos);
+    free(buf);
+}
+
+/* mesma chave nos métodos disponíveis, lado a lado */
+static void acao_comparar_chave(Tabela *t)
+{
+    unsigned long long chave;
+    char prompt[96], tempo[32], acessos[96], *buf;
+    int achou = 0;
+
+    snprintf(prompt, sizeof prompt, "%s: ", t->campos[t->idx_chave].nome);
+    if (!ler_u64(prompt, 0, 0, &chave)) return;
+    buf = tabela_novo_buf(t);
+    if (!buf) return;
+
+    printf("\n");
+    coluna("Método", 32, 0); coluna("Tempo", 12, 1); printf("   Acessos\n");
+    for (int m = BUSCA_BINARIA; m <= BUSCA_ARVORE; m++) {
+        Loc L;
+        double ms;
+        if ((m == BUSCA_INDICE && !t->idx_ok) || (m == BUSCA_ARVORE && !t->arvore)) continue;
+        if (m == BUSCA_INDICE_MEM && (!t->idx_ok || tabela_indice_mem_carregar(t) != 0)) continue;
+        ms = buscar_chave(t, m, chave, &L, buf);
+        descrever_acessos(m, &L, acessos, sizeof acessos);
+        coluna(NOME_BUSCA[m], 32, 0); coluna(fmt_tempo(ms, tempo), 12, 1); printf("   %s\n", acessos);
+        achou = L.achou;
+    }
+    printf("%s\n", achou ? "" : "(chave não encontrada)");
+    if (achou) {
+        tabela_imprimir_cab(t);
+        tabela_imprimir_reg(t, buf, -1);
+    }
+    free(buf);
+}
+
+/* ---------- por product_id em pessoas (coluna que não é a chave) ---------- */
+
+enum { PID_ARQUIVO = 0, PID_HASH = 1 };
+static const char *NOME_PID[] = { "Leitura do arquivo inteiro (sem índice)", "Tabela hash (memória)" };
+
+#define PID_MOSTRAR 10          /* registros exibidos por pesquisa */
+#define PID_LOTE    4096        /* registros por fread na leitura do arquivo */
+
+typedef struct {
+    long    achados;
+    int64_t pos[PID_MOSTRAR];   /* primeiros endereços encontrados */
+    int     comparacoes;        /* hash: nós visitados no balde */
+    size_t  balde;
+} ResPid;
+
+static void guardar_pos(ResPid *r, int64_t pos)
+{
+    if (r->achados < PID_MOSTRAR) r->pos[r->achados] = pos;
+    r->achados++;
+}
+
+/* acha todos os registros com o valor e traz cada um do disco; devolve o tempo em ms */
+static double buscar_pid(Tabela *t, int metodo, uint64_t valor, ResPid *r, char *buf)
+{
+    double t0;
+    memset(r, 0, sizeof *r);
+
+    if (metodo == PID_HASH) {
+        const NoHash *no;
+        t0 = agora_ms();
+        r->balde = th_funcao(t->hash, valor);
+        no = th_buscar(t->hash, valor, &r->comparacoes);
+        if (no)
+            for (int i = 0; i < no->n; i++)
+                if (tabela_ler_reg(t, no->end[i], buf) == 0) guardar_pos(r, no->end[i]);
+        return agora_ms() - t0;
+    } else {
+        /* product_id não é a chave de ordenação: sem índice, é preciso ler o arquivo todo */
+        int64_t total = t->n_princ + t->n_ext;
+        char *lote = (char *)malloc((size_t)PID_LOTE * (size_t)t->tam_reg);
+        if (!lote) return 0;
+        t0 = agora_ms();
+        if (total > 0 && tabela_ler_reg(t, 0, buf) == 0) {         /* lê o 1º e fica no 2º */
+            if (!tabela_removido(t, buf) && tabela_campo_u64(t, buf, t->campo_hash) == valor) guardar_pos(r, 0);
+            for (int64_t pos = 1; pos < total; ) {
+                int64_t q = total - pos < PID_LOTE ? total - pos : PID_LOTE;
+                if (fread(lote, (size_t)t->tam_reg, (size_t)q, t->f) != (size_t)q) break;
+                for (int64_t i = 0; i < q; i++) {
+                    char *reg = lote + i * t->tam_reg;
+                    tabela_decifrar_campo(t, pos + i, reg, t->campo_hash);   /* só product_id e delete */
+                    if (!tabela_removido(t, reg) && tabela_campo_u64(t, reg, t->campo_hash) == valor) guardar_pos(r, pos + i);
+                }
+                pos += q;
+            }
+        }
+        t0 = agora_ms() - t0;
+        free(lote);
+        return t0;
+    }
+}
+
+static void descrever_pid(Tabela *t, int metodo, const ResPid *r, char *out, size_t n)
+{
+    if (metodo == PID_HASH)
+        snprintf(out, n, "balde %lu, %d comparação(ões) + %ld leitura(s) no arquivo",
+                 (unsigned long)r->balde, r->comparacoes, r->achados);
+    else
+        snprintf(out, n, "%lld registros lidos", (long long)(t->n_princ + t->n_ext));
+}
+
+static void mostrar_achados_pid(Tabela *t, const ResPid *r, char *buf)
+{
+    if (r->achados == 0) return;
+    tabela_imprimir_cab(t);
+    for (long i = 0; i < r->achados && i < PID_MOSTRAR; i++)
+        if (tabela_ler_reg(t, r->pos[i], buf) == 0) tabela_imprimir_reg(t, buf, r->pos[i]);
+    if (r->achados > PID_MOSTRAR) printf("... (mais %ld)\n", r->achados - PID_MOSTRAR);
+}
+
+static int ler_pid(Tabela *t, unsigned long long *valor)
+{
+    char prompt[96];
+    snprintf(prompt, sizeof prompt, "%s: ", t->campos[t->campo_hash].nome);
+    return ler_u64(prompt, 0, 0, valor);
+}
+
+static void acao_busca_pid(Tabela *t, int metodo)
+{
+    unsigned long long valor;
+    char tempo[32], acessos[128], *buf;
+    ResPid r;
+    double ms;
+
+    if (metodo == PID_HASH && !t->hash) { printf("Tabela hash indisponível.\n"); return; }
+    if (!ler_pid(t, &valor)) return;
+    buf = tabela_novo_buf(t);
+    if (!buf) return;
+
+    ms = buscar_pid(t, metodo, valor, &r, buf);
+    descrever_pid(t, metodo, &r, acessos, sizeof acessos);
+    printf("\n[%s]\n", NOME_PID[metodo]);
+    mostrar_achados_pid(t, &r, buf);
+    printf("%ld registro(s) com %s = %llu\n", r.achados, t->campos[t->campo_hash].nome, valor);
+    printf("Tempo: %s | %s\n", fmt_tempo(ms, tempo), acessos);
+    free(buf);
+}
+
+static void acao_comparar_pid(Tabela *t)
+{
+    unsigned long long valor;
+    char tempo[32], acessos[128], *buf;
+    double ms[2];
+    ResPid r;
+
+    if (!t->hash) { printf("Tabela hash indisponível.\n"); return; }
+    if (!ler_pid(t, &valor)) return;
+    buf = tabela_novo_buf(t);
+    if (!buf) return;
+
+    printf("\n");
+    coluna("Método", 42, 0); coluna("Tempo", 12, 1); printf("   Acessos\n");
+    for (int m = PID_ARQUIVO; m <= PID_HASH; m++) {
+        ms[m] = buscar_pid(t, m, valor, &r, buf);
+        descrever_pid(t, m, &r, acessos, sizeof acessos);
+        coluna(NOME_PID[m], 42, 0); coluna(fmt_tempo(ms[m], tempo), 12, 1); printf("   %s\n", acessos);
+    }
+    printf("%ld registro(s) com %s = %llu", r.achados, t->campos[t->campo_hash].nome, valor);
+    if (ms[PID_HASH] > 0 && ms[PID_ARQUIVO] >= ms[PID_HASH])
+        printf(" | hash %.0fx mais rápida\n", ms[PID_ARQUIVO] / ms[PID_HASH]);
+    else if (ms[PID_ARQUIVO] > 0)
+        printf(" | hash %.1fx mais lenta (muitos registros espalhados pelo arquivo)\n", ms[PID_HASH] / ms[PID_ARQUIVO]);
+    else
+        printf("\n");
+    free(buf);
+}
+
+/* ---------- submenu ---------- */
+
+static void menu_pesquisas(Tabela *t)
+{
+    const char *ch = t->campos[t->idx_chave].nome;
+    int op;
+    for (;;) {
+        printf("\n----------- Consultas: %s -----------\n", t->nome);
+        printf(" 1 - %s: pesquisa binária no arquivo de dados\n", ch);
+        printf(" 2 - %s: índice parcial (arquivo .idx)\n", ch);
+        if (t->usa_arvore) {
+            printf(" 3 - %s: índice parcial carregado em memória\n", ch);
+            printf(" 4 - %s: árvore B+ (índice em memória)\n", ch);
+            printf(" 5 - Comparar os quatro métodos para o mesmo %s\n", ch);
+        } else if (t->usa_hash) {
+            const char *col = t->campos[t->campo_hash].nome;
+            printf(" 3 - %s: leitura do arquivo inteiro (sem índice)\n", col);
+            printf(" 4 - %s: tabela hash (índice em memória)\n", col);
+            printf(" 5 - Comparar arquivo x hash para o mesmo %s\n", col);
+        }
+        puts(" 0 - Voltar");
+        op = ler_opcao();
+        if (op == 0) return;
+        if (op == 1)      acao_busca(t, BUSCA_BINARIA);
+        else if (op == 2) acao_busca(t, BUSCA_INDICE);
+        else if (t->usa_arvore && op == 3) acao_busca(t, BUSCA_INDICE_MEM);
+        else if (t->usa_arvore && op == 4) acao_busca(t, BUSCA_ARVORE);
+        else if (t->usa_arvore && op == 5) acao_comparar_chave(t);
+        else if (t->usa_hash && op == 3)   acao_busca_pid(t, PID_ARQUIVO);
+        else if (t->usa_hash && op == 4)   acao_busca_pid(t, PID_HASH);
+        else if (t->usa_hash && op == 5)   acao_comparar_pid(t);
+        else printf("Opção inválida.\n");
+    }
+}
+
 static void menu_tabela(Tabela *t)
 {
     int op;
@@ -471,44 +708,48 @@ static void menu_tabela(Tabela *t)
         printf("\n=========== %s  [%s] ===========\n", t->nome, t->arq_dados);
         printf("Área principal: %lld registros | Extensão: %lld registros | Índice: %llu nível(is), 1 entrada a cada %llu\n",
                (long long)t->n_princ, (long long)t->n_ext, (unsigned long long)t->idx.n_niveis, (unsigned long long)t->k);
+        printf("Arquivo de dados: %s\n", t->cifrado ? "CRIPTOGRAFADO (XOR)" : "em claro (sem criptografia)");
         puts(" 1 - Importar dados iniciais de um CSV (gera o .dat binário e o índice)");
         puts(" 2 - Mostrar dados: primeiros 50 registros + área de extensão");
         puts(" 3 - Mostrar dados: intervalo na ordem física (como está gravado, com removidos)");
         puts(" 4 - Mostrar dados: intervalo na ordem lógica (sem removidos, extensão no lugar pelo elo)");
-        puts(" 5 - Pesquisa binária direto no arquivo de dados");
-        puts(" 6 - Consulta pelo índice parcial");
-        puts(" 7 - Inserir registro (vai para a extensão, ligado pelo elo)");
-        puts(" 8 - Remover registro (marca o campo delete)");
-        puts(" 9 - Reorganizar arquivo (aplica extensão, descarta removidos, refaz índice)");
-        puts("10 - Informações do arquivo e como o índice foi construído");
+        if (t->usa_arvore)
+            puts(" 5 - Consultas (pesquisa binária, índice em arquivo, índice em memória e árvore B+)");
+        else if (t->usa_hash)
+            puts(" 5 - Consultas (pesquisa binária, índice em arquivo e tabela hash em memória)");
+        else
+            puts(" 5 - Consultas (pesquisa binária e índice em arquivo)");
+        puts(" 6 - Inserir registro (vai para a extensão, ligado pelo elo)");
+        puts(" 7 - Remover registro (marca o campo delete)");
+        puts(" 8 - Reorganizar arquivo (aplica extensão, descarta removidos, refaz índice)");
+        puts(" 9 - Informações do arquivo e como o índice foi construído");
         if (t->usa_arvore) {
-            puts("11 - Consulta pela árvore B+ (índice em memória)");
-            puts("12 - Árvore B+: ordem, níveis e conteúdo dos nós");
-            puts("13 - Árvore B+: trocar a ordem (1, 2 ou 3)");
+            puts("10 - Árvore B+: ordem, níveis e conteúdo dos nós");
+            puts("11 - Árvore B+: trocar a ordem (1, 2 ou 3)");
         } else if (t->usa_hash) {
-            printf("11 - Consulta por %s pela tabela hash (índice em memória)\n", t->campos[t->campo_hash].nome);
-            puts("12 - Tabela hash: função, colisões e distribuição dos baldes");
+            puts("10 - Tabela hash: função, colisões e distribuição dos baldes");
         }
         puts(" 0 - Voltar");
         op = ler_opcao();
-        if (op >= 11 && op <= 13 && !t->usa_arvore)                 /* opções do hash: 111 e 112 */
-            op = (t->usa_hash && op <= 12) ? 100 + op : -1;
         switch (op) {
-            case 111: acao_hash_busca(t); break;
-            case 112: acao_hash_info(t); break;
             case 1:  acao_importar(t); break;
             case 2:  acao_primeiros(t); break;
             case 3:  acao_intervalo(t); break;
             case 4:  acao_intervalo_logico(t); break;
-            case 5:  acao_busca(t, BUSCA_BINARIA); break;
-            case 6:  acao_busca(t, BUSCA_INDICE); break;
-            case 11: acao_busca(t, BUSCA_ARVORE); break;
-            case 12: acao_arvore_estrutura(t); break;
-            case 13: acao_arvore_ordem(t); break;
-            case 7:  acao_inserir(t); break;
-            case 8:  acao_remover(t); break;
-            case 9:  acao_reorganizar(t); break;
-            case 10: acao_info(t); break;
+            case 5:  menu_pesquisas(t); break;
+            case 6:  acao_inserir(t); break;
+            case 7:  acao_remover(t); break;
+            case 8:  acao_reorganizar(t); break;
+            case 9:  acao_info(t); break;
+            case 10:
+                if (t->usa_arvore)    acao_arvore_estrutura(t);
+                else if (t->usa_hash) acao_hash_info(t);
+                else printf("Opção inválida.\n");
+                break;
+            case 11:
+                if (t->usa_arvore) acao_arvore_ordem(t);
+                else printf("Opção inválida.\n");
+                break;
             case 0:  return;
             default: printf("Opção inválida.\n");
         }
@@ -573,6 +814,41 @@ static void ir_para_pasta_do_projeto(void)
     }
 }
 
+/* ---------- criptografia ---------- */
+
+/* mostra o 1º registro como está gravado no disco (só caracteres visíveis; o resto vira '.') */
+static void mostrar_bruto(Tabela *t)
+{
+    char *buf = tabela_novo_buf(t);
+    if (!buf) return;
+    if (t->n_princ + t->n_ext > 0 && tabela_ler_bruto(t, 0, buf) == 0) {
+        printf("    1º registro no disco: [");
+        for (int i = 0; i < t->tam_reg - 1; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            putchar(c >= 32 && c < 127 ? c : '.');
+        }
+        printf("]\n");
+    }
+    free(buf);
+}
+
+/* Os arquivos de dados ficam sempre criptografados: se ao abrir algum estiver em claro
+ * (ex.: arquivo antigo), é cifrado aqui, uma vez só. */
+static int garantir_cifrado(Tabela *t)
+{
+    char b[32];
+    double t0;
+    if (t->cifrado) return 0;
+    printf("\n%s está em claro: criptografando com XOR (chave 'A')...\n", t->arq_dados);
+    mostrar_bruto(t);
+    t0 = agora_ms();
+    if (tabela_alternar_cifra(t) != 0) { printf("    Erro: %s\n", t->erro); return -1; }
+    printf("    Criptografado em %s (%lld registros)\n", fmt_tempo(agora_ms() - t0, b),
+           (long long)(t->n_princ + t->n_ext));
+    mostrar_bruto(t);
+    return 0;
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -582,6 +858,12 @@ int main(void)
     printf("Trabalho 1 - Arquivos binários com índice parcial\n");
     if (tabela_abrir(&produtos) != 0) { printf("Erro ao abrir produtos: %s\n", produtos.erro); return 1; }
     if (tabela_abrir(&pessoas)  != 0) { printf("Erro ao abrir pessoas: %s\n",  pessoas.erro);  return 1; }
+    if (garantir_cifrado(&produtos) != 0 || garantir_cifrado(&pessoas) != 0) return 1;
+    printf("\nArquivos de dados criptografados com XOR (chave 'A'): cada registro é decifrado na memória\n"
+           "quando é lido e cifrado de novo quando é gravado.\n");
+    printf("\nÍndices carregados em memória:\n");
+    mostrar_tempos(&produtos);
+    mostrar_tempos(&pessoas);
 
     for (;;) {
         puts("\n================ MENU PRINCIPAL ================");

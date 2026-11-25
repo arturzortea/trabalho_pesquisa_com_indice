@@ -105,8 +105,18 @@ typedef struct Tabela {
     int64_t     n_princ;
     int64_t     n_ext;
     int64_t     cab_elo;
+    int         cifrado;        /* 1 = registros gravados cifrados com XOR (flag no cabeçalho) */
     CabIdx      idx;
     int         idx_ok;
+    EntradaIdx *idx_mem;        /* cópia do índice parcial em memória (NULL = não carregado) */
+    uint64_t    idx_mem_n;      /* entradas na cópia em memória (todos os níveis)            */
+
+    /* ---- tempos de criação dos índices, em ms (medidos a cada vez que são feitos) ---- */
+    int         idx_refeito;    /* 1 = .idx foi (re)construído; 0 = só lido do disco       */
+    double      ms_indice;      /* construir (ou validar/abrir) o .idx                     */
+    double      ms_indice_mem;  /* carregar os níveis do .idx para a memória               */
+    double      ms_arvore;      /* montar a árvore B+                                      */
+    double      ms_hash;        /* montar a tabela hash                                    */
     struct ArvoreBP *arvore;    /* índice árvore B+ em memória (NULL se não usa)  */
     struct TabelaHash *hash;    /* índice hash em memória (NULL se não usa)       */
     char        erro[200];
@@ -152,6 +162,8 @@ void     tabela_imprimir_reg(const Tabela *t, const char *reg, int64_t pos);
 int      tabela_busca_binaria(Tabela *t, uint64_t chave, Loc *L);            /* 3) pesquisa binária */
 int      tabela_busca_indice(Tabela *t, uint64_t chave, Loc *L);             /* 4) via índice parcial */
 int      tabela_localizar(Tabela *t, uint64_t chave, Loc *L);                /* usa índice se houver */
+int      tabela_indice_mem_carregar(Tabela *t);   /* lê todos os níveis do .idx para a memória */
+int      tabela_busca_indice_mem(Tabela *t, uint64_t chave, Loc *L);         /* índice parcial já em memória */
 int      tabela_inserir(Tabela *t, const char *const vals[]);                /* 5) inserir        */
 int      tabela_remover(Tabela *t, uint64_t chave);                          /* 6) remover        */
 int      tabela_reorganizar(Tabela *t, long *incorporados, long *descartados);
@@ -161,16 +173,31 @@ int      tabela_percorrer(Tabela *t, CbReg cb, void *ctx);
 int      tabela_indice_construir(Tabela *t);
 
 /* índice árvore B+ em memória (só para tabelas com usa_arvore = 1).
- * A árvore guarda (chave, endereço) de TODOS os registros do arquivo, inclusive os da
- * extensão e os marcados como removidos (que continuam no mesmo endereço). */
+ * A árvore guarda (chave, endereço) dos registros ATIVOS do arquivo (área principal e
+ * extensão); os marcados como removidos ficam fora, por isso não são mais achados. */
 int      tabela_arvore_construir(Tabela *t, int ordem);           /* ordem 1, 2 ou 3 */
 int      tabela_busca_arvore(Tabela *t, uint64_t chave, Loc *L);  /* L->cmp_idx = nós visitados */
 
 /* índice hash em memória sobre a coluna campo_hash (só para tabelas com usa_hash = 1).
- * Guarda os endereços de TODOS os registros do arquivo (área principal e extensão). */
+ * Guarda os endereços dos registros ATIVOS do arquivo (área principal e extensão). */
 int      tabela_hash_construir(Tabela *t);
 uint64_t tabela_campo_u64(const Tabela *t, const char *reg, int i);     /* campo numérico */
 int      tabela_localizar_rapido(Tabela *t, uint64_t chave, Loc *L); /* árvore se houver; senão índice */
+
+/* Refaz o .idx (e a cópia em memória), a árvore B+ e a tabela hash, medindo cada tempo.
+ * Chamada depois de inserir ou remover um registro. */
+int      tabela_refazer_indices(Tabela *t);
+
+/* Criptografia XOR dos registros (o cabeçalho fica sempre em claro, com a flag 'cifrado').
+ * Toda leitura decifra só o registro lido, na memória; toda gravação cifra antes de gravar.
+ * Os registros continuam com o mesmo tamanho, então posições, índices e elos não mudam. */
+int      tabela_alternar_cifra(Tabela *t);                      /* cifra se está em claro, e vice-versa */
+void     tabela_decifrar_reg(const Tabela *t, int64_t pos, char *reg);   /* para quem lê com fread */
+void     tabela_decifrar_campo(const Tabela *t, int64_t pos, char *reg, int i); /* só o campo i + delete */
+int      tabela_ler_bruto(Tabela *t, int64_t pos, char *buf);   /* bytes como estão no disco */
+
+/* relógio de alta resolução (ms), usado para medir a criação dos índices e as buscas */
+double   tabela_relogio_ms(void);
 
 /* informações */
 void     tabela_info(Tabela *t);
